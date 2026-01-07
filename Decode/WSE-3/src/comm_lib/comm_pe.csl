@@ -66,7 +66,8 @@ const reduce_1st_0_send_bsz = @get_dsd(fabout_dsd, .{
     .fabric_color = reduce_1st_color_0,
     .output_queue = reduce_1st_0_send_queue_id,
     // .simd_mode = .{ .simd_32 = true },
-    .simd_mode = .{ .simd_64 = true },
+    // .simd_mode = .{ .simd_64 = true },
+    .simd_mode = .{ .simd_max = true },
 });
 
 const reduce_1st_0_recv_bsz = @get_dsd(fabin_dsd, .{
@@ -74,7 +75,8 @@ const reduce_1st_0_recv_bsz = @get_dsd(fabin_dsd, .{
     .fabric_color = reduce_1st_color_0,
     .input_queue = reduce_1st_0_recv_queue_id,
     // .simd_mode = .{ .simd_32 = true },
-    .simd_mode = .{ .simd_64 = true },
+    // .simd_mode = .{ .simd_64 = true },
+    .simd_mode = .{ .simd_max = true },
 });
 
 const reduce_1st_1_send_bsz = @get_dsd(fabout_dsd, .{
@@ -82,7 +84,8 @@ const reduce_1st_1_send_bsz = @get_dsd(fabout_dsd, .{
     .fabric_color = reduce_1st_color_1,
     .output_queue = reduce_1st_1_send_queue_id,
     // .simd_mode = .{ .simd_32 = true },
-    .simd_mode = .{ .simd_64 = true },
+    // .simd_mode = .{ .simd_64 = true },
+    .simd_mode = .{ .simd_max = true },
 });
 
 const reduce_1st_1_recv_bsz = @get_dsd(fabin_dsd, .{
@@ -90,7 +93,8 @@ const reduce_1st_1_recv_bsz = @get_dsd(fabin_dsd, .{
     .fabric_color = reduce_1st_color_1,
     .input_queue = reduce_1st_1_recv_queue_id,
     // .simd_mode = .{ .simd_32 = true },
-    .simd_mode = .{ .simd_64 = true },
+    // .simd_mode = .{ .simd_64 = true },
+    .simd_mode = .{ .simd_max = true },
 });
 
 const reduce_2nd_0_send_bsz = @get_dsd(fabout_dsd, .{
@@ -98,7 +102,8 @@ const reduce_2nd_0_send_bsz = @get_dsd(fabout_dsd, .{
     .fabric_color = reduce_2nd_color_0,
     .output_queue = reduce_2nd_0_send_queue_id,
     // .simd_mode = .{ .simd_32 = true },
-    .simd_mode = .{ .simd_64 = true },
+    // .simd_mode = .{ .simd_64 = true },
+    .simd_mode = .{ .simd_max = true },
 });
 
 const reduce_2nd_0_recv_bsz = @get_dsd(fabin_dsd, .{
@@ -106,7 +111,8 @@ const reduce_2nd_0_recv_bsz = @get_dsd(fabin_dsd, .{
     .fabric_color = reduce_2nd_color_0,
     .input_queue = reduce_2nd_0_recv_queue_id,
     // .simd_mode = .{ .simd_32 = true },
-    .simd_mode = .{ .simd_64 = true },
+    // .simd_mode = .{ .simd_64 = true },
+    .simd_mode = .{ .simd_max = true },
 });
 
 const reduce_2nd_1_send_bsz = @get_dsd(fabout_dsd, .{
@@ -114,7 +120,8 @@ const reduce_2nd_1_send_bsz = @get_dsd(fabout_dsd, .{
     .fabric_color = reduce_2nd_color_1,
     .output_queue = reduce_2nd_1_send_queue_id,
     // .simd_mode = .{ .simd_32 = true },
-    .simd_mode = .{ .simd_64 = true },
+    // .simd_mode = .{ .simd_64 = true },
+    .simd_mode = .{ .simd_max = true },
 });
 
 const reduce_2nd_1_recv_bsz = @get_dsd(fabin_dsd, .{
@@ -122,7 +129,8 @@ const reduce_2nd_1_recv_bsz = @get_dsd(fabin_dsd, .{
     .fabric_color = reduce_2nd_color_1,
     .input_queue = reduce_2nd_1_recv_queue_id,
     // .simd_mode = .{ .simd_32 = true },
-    .simd_mode = .{ .simd_64 = true },
+    // .simd_mode = .{ .simd_64 = true },
+    .simd_mode = .{ .simd_max = true },
 });
 
 
@@ -131,7 +139,8 @@ const bdcast_send_bsz = @get_dsd(fabout_dsd, .{
     .fabric_color = broadcast_color,
     .output_queue = broadcast_send_queue_id,
     // .simd_mode = .{ .simd_32 = true },
-    .simd_mode = .{ .simd_64 = true },
+    // .simd_mode = .{ .simd_64 = true },
+    .simd_mode = .{ .simd_max = true },
 });
 
 const bdcast_recv_bsz = @get_dsd(fabin_dsd, .{
@@ -139,7 +148,8 @@ const bdcast_recv_bsz = @get_dsd(fabin_dsd, .{
     .fabric_color = broadcast_color,
     .input_queue = broadcast_recv_queue_id,
     // .simd_mode = .{ .simd_32 = true },
-    .simd_mode = .{ .simd_64 = true },
+    // .simd_mode = .{ .simd_64 = true },
+    .simd_mode = .{ .simd_max = true },
 });
 
 // *************************** bsz * dim_p_pe ***************************//
@@ -148,7 +158,8 @@ const reduce_1st_0_send_bsz_dim = @get_dsd(fabout_dsd, .{
     .fabric_color = reduce_1st_color_0,
     .output_queue = reduce_1st_0_send_queue_id,
     // .simd_mode = .{ .simd_32 = true },
-    .simd_mode = .{ .simd_64 = true },
+    // .simd_mode = .{ .simd_64 = true },
+    .simd_mode = .{ .simd_max = true },
 });
 
 const reduce_1st_0_recv_bsz_dim = @get_dsd(fabin_dsd, .{
@@ -156,7 +167,8 @@ const reduce_1st_0_recv_bsz_dim = @get_dsd(fabin_dsd, .{
     .fabric_color = reduce_1st_color_0,
     .input_queue = reduce_1st_0_recv_queue_id,
     // .simd_mode = .{ .simd_32 = true },
-    .simd_mode = .{ .simd_64 = true },
+    // .simd_mode = .{ .simd_64 = true },
+    .simd_mode = .{ .simd_max = true },
 });
 
 const reduce_1st_1_send_bsz_dim = @get_dsd(fabout_dsd, .{
@@ -164,7 +176,8 @@ const reduce_1st_1_send_bsz_dim = @get_dsd(fabout_dsd, .{
     .fabric_color = reduce_1st_color_1,
     .output_queue = reduce_1st_1_send_queue_id,
     // .simd_mode = .{ .simd_32 = true },
-    .simd_mode = .{ .simd_64 = true },
+    // .simd_mode = .{ .simd_64 = true },
+    .simd_mode = .{ .simd_max = true },
 });
 
 const reduce_1st_1_recv_bsz_dim = @get_dsd(fabin_dsd, .{
@@ -172,7 +185,8 @@ const reduce_1st_1_recv_bsz_dim = @get_dsd(fabin_dsd, .{
     .fabric_color = reduce_1st_color_1,
     .input_queue = reduce_1st_1_recv_queue_id,
     // .simd_mode = .{ .simd_32 = true },
-    .simd_mode = .{ .simd_64 = true },
+    // .simd_mode = .{ .simd_64 = true },
+    .simd_mode = .{ .simd_max = true },
 });
 
 const reduce_2nd_0_send_bsz_dim = @get_dsd(fabout_dsd, .{
@@ -180,7 +194,8 @@ const reduce_2nd_0_send_bsz_dim = @get_dsd(fabout_dsd, .{
     .fabric_color = reduce_2nd_color_0,
     .output_queue = reduce_2nd_0_send_queue_id,
     // .simd_mode = .{ .simd_32 = true },
-    .simd_mode = .{ .simd_64 = true },
+    // .simd_mode = .{ .simd_64 = true },
+    .simd_mode = .{ .simd_max = true },
 });
 
 const reduce_2nd_0_recv_bsz_dim = @get_dsd(fabin_dsd, .{
@@ -188,7 +203,8 @@ const reduce_2nd_0_recv_bsz_dim = @get_dsd(fabin_dsd, .{
     .fabric_color = reduce_2nd_color_0,
     .input_queue = reduce_2nd_0_recv_queue_id,
     // .simd_mode = .{ .simd_32 = true },
-    .simd_mode = .{ .simd_64 = true },
+    // .simd_mode = .{ .simd_64 = true },
+    .simd_mode = .{ .simd_max = true },
 });
 
 const reduce_2nd_1_send_bsz_dim = @get_dsd(fabout_dsd, .{
@@ -196,7 +212,8 @@ const reduce_2nd_1_send_bsz_dim = @get_dsd(fabout_dsd, .{
     .fabric_color = reduce_2nd_color_1,
     .output_queue = reduce_2nd_1_send_queue_id,
     // .simd_mode = .{ .simd_32 = true },
-    .simd_mode = .{ .simd_64 = true },
+    // .simd_mode = .{ .simd_64 = true },
+    .simd_mode = .{ .simd_max = true },
 });
 
 const reduce_2nd_1_recv_bsz_dim = @get_dsd(fabin_dsd, .{
@@ -204,7 +221,8 @@ const reduce_2nd_1_recv_bsz_dim = @get_dsd(fabin_dsd, .{
     .fabric_color = reduce_2nd_color_1,
     .input_queue = reduce_2nd_1_recv_queue_id,
     // .simd_mode = .{ .simd_32 = true },
-    .simd_mode = .{ .simd_64 = true },
+    // .simd_mode = .{ .simd_64 = true },
+    .simd_mode = .{ .simd_max = true },
 });
 
 
@@ -213,7 +231,8 @@ const bdcast_send_bsz_dim = @get_dsd(fabout_dsd, .{
     .fabric_color = broadcast_color,
     .output_queue = broadcast_send_queue_id,
     // .simd_mode = .{ .simd_32 = true },
-    .simd_mode = .{ .simd_64 = true },
+    // .simd_mode = .{ .simd_64 = true },
+    .simd_mode = .{ .simd_max = true },
 });
 
 const bdcast_recv_bsz_dim = @get_dsd(fabin_dsd, .{
@@ -221,7 +240,8 @@ const bdcast_recv_bsz_dim = @get_dsd(fabin_dsd, .{
     .fabric_color = broadcast_color,
     .input_queue = broadcast_recv_queue_id,
     // .simd_mode = .{ .simd_32 = true },
-    .simd_mode = .{ .simd_64 = true },
+    // .simd_mode = .{ .simd_64 = true },
+    .simd_mode = .{ .simd_max = true },
 });
 
 // *************************** bsz * 3 * dim_p_pe ***************************//
@@ -230,7 +250,8 @@ const reduce_1st_0_send_bsz_dim_QKV_fusion = @get_dsd(fabout_dsd, .{
     .fabric_color = reduce_1st_color_0,
     .output_queue = reduce_1st_0_send_queue_id,
     // .simd_mode = .{ .simd_32 = true },
-    .simd_mode = .{ .simd_64 = true },
+    // .simd_mode = .{ .simd_64 = true },
+    .simd_mode = .{ .simd_max = true },
 });
 
 const reduce_1st_0_recv_bsz_dim_QKV_fusion = @get_dsd(fabin_dsd, .{
@@ -238,7 +259,8 @@ const reduce_1st_0_recv_bsz_dim_QKV_fusion = @get_dsd(fabin_dsd, .{
     .fabric_color = reduce_1st_color_0,
     .input_queue = reduce_1st_0_recv_queue_id,
     // .simd_mode = .{ .simd_32 = true },
-    .simd_mode = .{ .simd_64 = true },
+    // .simd_mode = .{ .simd_64 = true },
+    .simd_mode = .{ .simd_max = true },
 });
 
 const reduce_1st_1_send_bsz_dim_QKV_fusion = @get_dsd(fabout_dsd, .{
@@ -246,7 +268,8 @@ const reduce_1st_1_send_bsz_dim_QKV_fusion = @get_dsd(fabout_dsd, .{
     .fabric_color = reduce_1st_color_1,
     .output_queue = reduce_1st_1_send_queue_id,
     // .simd_mode = .{ .simd_32 = true },
-    .simd_mode = .{ .simd_64 = true },
+    // .simd_mode = .{ .simd_64 = true },
+    .simd_mode = .{ .simd_max = true },
 });
 
 const reduce_1st_1_recv_bsz_dim_QKV_fusion = @get_dsd(fabin_dsd, .{
@@ -254,7 +277,8 @@ const reduce_1st_1_recv_bsz_dim_QKV_fusion = @get_dsd(fabin_dsd, .{
     .fabric_color = reduce_1st_color_1,
     .input_queue = reduce_1st_1_recv_queue_id,
     // .simd_mode = .{ .simd_32 = true },
-    .simd_mode = .{ .simd_64 = true },
+    // .simd_mode = .{ .simd_64 = true },
+    .simd_mode = .{ .simd_max = true },
 });
 
 const reduce_2nd_0_send_bsz_dim_QKV_fusion = @get_dsd(fabout_dsd, .{
@@ -262,7 +286,8 @@ const reduce_2nd_0_send_bsz_dim_QKV_fusion = @get_dsd(fabout_dsd, .{
     .fabric_color = reduce_2nd_color_0,
     .output_queue = reduce_2nd_0_send_queue_id,
     // .simd_mode = .{ .simd_32 = true },
-    .simd_mode = .{ .simd_64 = true },
+    // .simd_mode = .{ .simd_64 = true },
+    .simd_mode = .{ .simd_max = true },
 });
 
 const reduce_2nd_0_recv_bsz_dim_QKV_fusion = @get_dsd(fabin_dsd, .{
@@ -270,7 +295,8 @@ const reduce_2nd_0_recv_bsz_dim_QKV_fusion = @get_dsd(fabin_dsd, .{
     .fabric_color = reduce_2nd_color_0,
     .input_queue = reduce_2nd_0_recv_queue_id,
     // .simd_mode = .{ .simd_32 = true },
-    .simd_mode = .{ .simd_64 = true },
+    // .simd_mode = .{ .simd_64 = true },
+    .simd_mode = .{ .simd_max = true },
 });
 
 const reduce_2nd_1_send_bsz_dim_QKV_fusion = @get_dsd(fabout_dsd, .{
@@ -278,7 +304,8 @@ const reduce_2nd_1_send_bsz_dim_QKV_fusion = @get_dsd(fabout_dsd, .{
     .fabric_color = reduce_2nd_color_1,
     .output_queue = reduce_2nd_1_send_queue_id,
     // .simd_mode = .{ .simd_32 = true },
-    .simd_mode = .{ .simd_64 = true },
+    // .simd_mode = .{ .simd_64 = true },
+    .simd_mode = .{ .simd_max = true },
 });
 
 const reduce_2nd_1_recv_bsz_dim_QKV_fusion = @get_dsd(fabin_dsd, .{
@@ -286,7 +313,8 @@ const reduce_2nd_1_recv_bsz_dim_QKV_fusion = @get_dsd(fabin_dsd, .{
     .fabric_color = reduce_2nd_color_1,
     .input_queue = reduce_2nd_1_recv_queue_id,
     // .simd_mode = .{ .simd_32 = true },
-    .simd_mode = .{ .simd_64 = true },
+    // .simd_mode = .{ .simd_64 = true },
+    .simd_mode = .{ .simd_max = true },
 });
 
 
@@ -295,7 +323,8 @@ const bdcast_send_bsz_dim_QKV_fusion = @get_dsd(fabout_dsd, .{
     .fabric_color = broadcast_color,
     .output_queue = broadcast_send_queue_id,
     // .simd_mode = .{ .simd_32 = true },
-    .simd_mode = .{ .simd_64 = true },
+    // .simd_mode = .{ .simd_64 = true },
+    .simd_mode = .{ .simd_max = true },
 });
 
 const bdcast_recv_bsz_dim_QKV_fusion = @get_dsd(fabin_dsd, .{
@@ -303,7 +332,8 @@ const bdcast_recv_bsz_dim_QKV_fusion = @get_dsd(fabin_dsd, .{
     .fabric_color = broadcast_color,
     .input_queue = broadcast_recv_queue_id,
     // .simd_mode = .{ .simd_32 = true },
-    .simd_mode = .{ .simd_64 = true },
+    // .simd_mode = .{ .simd_64 = true },
+    .simd_mode = .{ .simd_max = true },
 });
 
 // ************************* bsz * seq_len_p_pe *************************//
@@ -312,7 +342,8 @@ const reduce_1st_0_send_bsz_seq_len = @get_dsd(fabout_dsd, .{
     .fabric_color = reduce_1st_color_0,
     .output_queue = reduce_1st_0_send_queue_id,
     // .simd_mode = .{ .simd_32 = true },
-    .simd_mode = .{ .simd_64 = true },
+    // .simd_mode = .{ .simd_64 = true },
+    .simd_mode = .{ .simd_max = true },
 });
 
 const reduce_1st_0_recv_bsz_seq_len = @get_dsd(fabin_dsd, .{
@@ -320,7 +351,8 @@ const reduce_1st_0_recv_bsz_seq_len = @get_dsd(fabin_dsd, .{
     .fabric_color = reduce_1st_color_0,
     .input_queue = reduce_1st_0_recv_queue_id,
     // .simd_mode = .{ .simd_32 = true },
-    .simd_mode = .{ .simd_64 = true },
+    // .simd_mode = .{ .simd_64 = true },
+    .simd_mode = .{ .simd_max = true },
 });
 
 const reduce_1st_1_send_bsz_seq_len = @get_dsd(fabout_dsd, .{
@@ -328,7 +360,8 @@ const reduce_1st_1_send_bsz_seq_len = @get_dsd(fabout_dsd, .{
     .fabric_color = reduce_1st_color_1,
     .output_queue = reduce_1st_1_send_queue_id,
     // .simd_mode = .{ .simd_32 = true },
-    .simd_mode = .{ .simd_64 = true },
+    // .simd_mode = .{ .simd_64 = true },
+    .simd_mode = .{ .simd_max = true },
 });
 
 const reduce_1st_1_recv_bsz_seq_len = @get_dsd(fabin_dsd, .{
@@ -336,7 +369,8 @@ const reduce_1st_1_recv_bsz_seq_len = @get_dsd(fabin_dsd, .{
     .fabric_color = reduce_1st_color_1,
     .input_queue = reduce_1st_1_recv_queue_id,
     // .simd_mode = .{ .simd_32 = true },
-    .simd_mode = .{ .simd_64 = true },
+    // .simd_mode = .{ .simd_64 = true },
+    .simd_mode = .{ .simd_max = true },
 });
 
 const reduce_2nd_0_send_bsz_seq_len = @get_dsd(fabout_dsd, .{
@@ -344,7 +378,8 @@ const reduce_2nd_0_send_bsz_seq_len = @get_dsd(fabout_dsd, .{
     .fabric_color = reduce_2nd_color_0,
     .output_queue = reduce_2nd_0_send_queue_id,
     // .simd_mode = .{ .simd_32 = true },
-    .simd_mode = .{ .simd_64 = true },
+    // .simd_mode = .{ .simd_64 = true },
+    .simd_mode = .{ .simd_max = true },
 });
 
 const reduce_2nd_0_recv_bsz_seq_len = @get_dsd(fabin_dsd, .{
@@ -352,7 +387,8 @@ const reduce_2nd_0_recv_bsz_seq_len = @get_dsd(fabin_dsd, .{
     .fabric_color = reduce_2nd_color_0,
     .input_queue = reduce_2nd_0_recv_queue_id,
     // .simd_mode = .{ .simd_32 = true },
-    .simd_mode = .{ .simd_64 = true },
+    // .simd_mode = .{ .simd_64 = true },
+    .simd_mode = .{ .simd_max = true },
 });
 
 const reduce_2nd_1_send_bsz_seq_len = @get_dsd(fabout_dsd, .{
@@ -360,7 +396,8 @@ const reduce_2nd_1_send_bsz_seq_len = @get_dsd(fabout_dsd, .{
     .fabric_color = reduce_2nd_color_1,
     .output_queue = reduce_2nd_1_send_queue_id,
     // .simd_mode = .{ .simd_32 = true },
-    .simd_mode = .{ .simd_64 = true },
+    // .simd_mode = .{ .simd_64 = true },
+    .simd_mode = .{ .simd_max = true },
 });
 
 const reduce_2nd_1_recv_bsz_seq_len = @get_dsd(fabin_dsd, .{
@@ -368,7 +405,8 @@ const reduce_2nd_1_recv_bsz_seq_len = @get_dsd(fabin_dsd, .{
     .fabric_color = reduce_2nd_color_1,
     .input_queue = reduce_2nd_1_recv_queue_id,
     // .simd_mode = .{ .simd_32 = true },
-    .simd_mode = .{ .simd_64 = true },
+    // .simd_mode = .{ .simd_64 = true },
+    .simd_mode = .{ .simd_max = true },
 });
 
 
@@ -377,7 +415,8 @@ const bdcast_send_bsz_seq_len = @get_dsd(fabout_dsd, .{
     .fabric_color = broadcast_color,
     .output_queue = broadcast_send_queue_id,
     // .simd_mode = .{ .simd_32 = true },
-    .simd_mode = .{ .simd_64 = true },
+    // .simd_mode = .{ .simd_64 = true },
+    .simd_mode = .{ .simd_max = true },
 });
 
 const bdcast_recv_bsz_seq_len = @get_dsd(fabin_dsd, .{
@@ -385,7 +424,8 @@ const bdcast_recv_bsz_seq_len = @get_dsd(fabin_dsd, .{
     .fabric_color = broadcast_color,
     .input_queue = broadcast_recv_queue_id,
     // .simd_mode = .{ .simd_32 = true },
-    .simd_mode = .{ .simd_64 = true },
+    // .simd_mode = .{ .simd_64 = true },
+    .simd_mode = .{ .simd_max = true },
 });
 
 // ************************* bsz * 2 * ffn_dim_p_pe *************************//
@@ -395,7 +435,8 @@ const reduce_1st_0_send_bsz_ffn_dim_ZZ_fusion = @get_dsd(fabout_dsd, .{
     .fabric_color = reduce_1st_color_0,
     .output_queue = reduce_1st_0_send_queue_id,
     // .simd_mode = .{ .simd_32_or_64 = true },
-    .simd_mode = .{ .simd_64 = true },
+    // .simd_mode = .{ .simd_64 = true },
+    .simd_mode = .{ .simd_max = true },
 });
 
 const reduce_1st_0_recv_bsz_ffn_dim_ZZ_fusion = @get_dsd(fabin_dsd, .{
@@ -403,7 +444,8 @@ const reduce_1st_0_recv_bsz_ffn_dim_ZZ_fusion = @get_dsd(fabin_dsd, .{
     .fabric_color = reduce_1st_color_0,
     .input_queue = reduce_1st_0_recv_queue_id,
     // .simd_mode = .{ .simd_32_or_64 = true },
-    .simd_mode = .{ .simd_64 = true },
+    // .simd_mode = .{ .simd_64 = true },
+    .simd_mode = .{ .simd_max = true },
 });
 
 const reduce_1st_1_send_bsz_ffn_dim_ZZ_fusion = @get_dsd(fabout_dsd, .{
@@ -411,7 +453,8 @@ const reduce_1st_1_send_bsz_ffn_dim_ZZ_fusion = @get_dsd(fabout_dsd, .{
     .fabric_color = reduce_1st_color_1,
     .output_queue = reduce_1st_1_send_queue_id,
     // .simd_mode = .{ .simd_32_or_64 = true },
-    .simd_mode = .{ .simd_64 = true },
+    // .simd_mode = .{ .simd_64 = true },
+    .simd_mode = .{ .simd_max = true },
 });
 
 const reduce_1st_1_recv_bsz_ffn_dim_ZZ_fusion = @get_dsd(fabin_dsd, .{
@@ -419,7 +462,8 @@ const reduce_1st_1_recv_bsz_ffn_dim_ZZ_fusion = @get_dsd(fabin_dsd, .{
     .fabric_color = reduce_1st_color_1,
     .input_queue = reduce_1st_1_recv_queue_id,
     // .simd_mode = .{ .simd_32_or_64 = true },
-    .simd_mode = .{ .simd_64 = true },
+    // .simd_mode = .{ .simd_64 = true },
+    .simd_mode = .{ .simd_max = true },
 });
 
 const reduce_2nd_0_send_bsz_ffn_dim_ZZ_fusion = @get_dsd(fabout_dsd, .{
@@ -427,7 +471,8 @@ const reduce_2nd_0_send_bsz_ffn_dim_ZZ_fusion = @get_dsd(fabout_dsd, .{
     .fabric_color = reduce_2nd_color_0,
     .output_queue = reduce_2nd_0_send_queue_id,
     // .simd_mode = .{ .simd_32_or_64 = true },
-    .simd_mode = .{ .simd_64 = true },
+    // .simd_mode = .{ .simd_64 = true },
+    .simd_mode = .{ .simd_max = true },
 });
 
 const reduce_2nd_0_recv_bsz_ffn_dim_ZZ_fusion = @get_dsd(fabin_dsd, .{
@@ -435,7 +480,8 @@ const reduce_2nd_0_recv_bsz_ffn_dim_ZZ_fusion = @get_dsd(fabin_dsd, .{
     .fabric_color = reduce_2nd_color_0,
     .input_queue = reduce_2nd_0_recv_queue_id,
     // .simd_mode = .{ .simd_32_or_64 = true },
-    .simd_mode = .{ .simd_64 = true },
+    // .simd_mode = .{ .simd_64 = true },
+    .simd_mode = .{ .simd_max = true },
 });
 
 const reduce_2nd_1_send_bsz_ffn_dim_ZZ_fusion = @get_dsd(fabout_dsd, .{
@@ -443,7 +489,8 @@ const reduce_2nd_1_send_bsz_ffn_dim_ZZ_fusion = @get_dsd(fabout_dsd, .{
     .fabric_color = reduce_2nd_color_1,
     .output_queue = reduce_2nd_1_send_queue_id,
     // .simd_mode = .{ .simd_32_or_64 = true },
-    .simd_mode = .{ .simd_64 = true },
+    // .simd_mode = .{ .simd_64 = true },
+    .simd_mode = .{ .simd_max = true },
 });
 
 const reduce_2nd_1_recv_bsz_ffn_dim_ZZ_fusion = @get_dsd(fabin_dsd, .{
@@ -451,7 +498,8 @@ const reduce_2nd_1_recv_bsz_ffn_dim_ZZ_fusion = @get_dsd(fabin_dsd, .{
     .fabric_color = reduce_2nd_color_1,
     .input_queue = reduce_2nd_1_recv_queue_id,
     // .simd_mode = .{ .simd_32_or_64 = true },
-    .simd_mode = .{ .simd_64 = true },
+    // .simd_mode = .{ .simd_64 = true },
+    .simd_mode = .{ .simd_max = true },
 });
 
 
@@ -460,7 +508,8 @@ const bdcast_send_bsz_ffn_dim_ZZ_fusion = @get_dsd(fabout_dsd, .{
     .fabric_color = broadcast_color,
     .output_queue = broadcast_send_queue_id,
     // .simd_mode = .{ .simd_32_or_64 = true },
-    .simd_mode = .{ .simd_64 = true },
+    // .simd_mode = .{ .simd_64 = true },
+    .simd_mode = .{ .simd_max = true },
 });
 
 const bdcast_recv_bsz_ffn_dim_ZZ_fusion = @get_dsd(fabin_dsd, .{
@@ -468,7 +517,8 @@ const bdcast_recv_bsz_ffn_dim_ZZ_fusion = @get_dsd(fabin_dsd, .{
     .fabric_color = broadcast_color,
     .input_queue = broadcast_recv_queue_id,
     // .simd_mode = .{ .simd_32_or_64 = true },
-    .simd_mode = .{ .simd_64 = true },
+    // .simd_mode = .{ .simd_64 = true },
+    .simd_mode = .{ .simd_max = true },
 });
 
 var vector_buf_dsd_bsz = @get_dsd(mem1d_dsd, .{ .base_address = &dummy, .extent = bsz });
