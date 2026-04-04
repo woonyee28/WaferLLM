@@ -1,0 +1,247 @@
+// SUMMA (Scalable Universal Matrix Multiply Algorithm)
+// At each step i, column i broadcasts X tiles to rows,
+// row i broadcasts W tiles to columns.
+// After both broadcasts complete, each PE computes C += Xp * Wp.
+
+// ---------------------- Input Parameters --------------------- //
+param memcpy_params: comptime_struct;
+param c2d_params: comptime_struct;
+
+param Mt: i16;
+param Kt: i16;
+param Nt: i16;
+
+// ---------------------- Input Matrix ------------------------ //
+
+var X_tile: [Mt*Kt]f16 = @zeros([Mt*Kt]f16);     // home tile
+var X_buffer: [Mt*Kt]f16 = @zeros([Mt*Kt]f16);    // recv buffer
+var ptr_X: [*]f16 = &X_tile;
+var X_dsd = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{Mt} -> X_tile[i] });
+
+var W_tile: [Kt*Nt]f16 = @zeros([Kt*Nt]f16);     // home tile
+var W_buffer: [Kt*Nt]f16 = @zeros([Kt*Nt]f16);    // recv buffer
+var ptr_W: [*]f16 = &W_tile;
+var W_dsd = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{Nt} -> W_tile[i] });
+
+// ---------------------- Output Matrix ----------------------- //
+
+var res_tile: [Mt*Nt]f16 = @zeros([Mt*Nt]f16);
+var ptr_res: [*]f16 = &res_tile;
+var res_dsd = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{Mt*Nt} -> res_tile[i] });
+
+// ---------------------- Modules ------------------------------ //
+
+const sys_mod = @import_module("<memcpy/memcpy>", memcpy_params);
+
+const P = @get_rectangle().width;
+
+// Task IDs
+const compute_task_id: local_task_id = @get_local_task_id(13);
+const x_task_id:       local_task_id = @get_local_task_id(14);
+const y_task_id:       local_task_id = @get_local_task_id(15);
+
+const mpi_x = @import_module("<collectives_2d/pe>", .{
+    .dim_params = c2d_params.x,
+    .queues = [2]u16{2, 4},
+    .dest_dsr_ids = [1]u16{1},
+    .src0_dsr_ids = [1]u16{1},
+    .src1_dsr_ids = [1]u16{1},
+});
+const mpi_y = @import_module("<collectives_2d/pe>", .{
+    .dim_params = c2d_params.y,
+    .queues = [2]u16{3, 5},
+    .dest_dsr_ids = [1]u16{2},
+    .src0_dsr_ids = [1]u16{2},
+    .src1_dsr_ids = [1]u16{2},
+});
+
+// ---------------------- Local Variables ---------------------- //
+
+var px: u16 = 0;
+var py: u16 = 0;
+
+var out_dsd = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{Mt} -> res_tile[i] });
+var ptr_out: [*]f16 = &res_tile;
+
+// Compute uses DSR 0; mpi_x uses DSR 1; mpi_y uses DSR 2
+const out_dest_dsr = @get_dsr(dsr_dest, 0);
+const out_src0_dsr = @get_dsr(dsr_src0, 0);
+const X_src1_dsr = @get_dsr(dsr_src1, 0);
+
+// ------------------------- Timer ------------------------- //
+
+const timestamp = @import_module("<time>");
+var tscStartBuffer = @zeros([timestamp.tsc_size_words]u16);
+var tscEndBuffer = @zeros([timestamp.tsc_size_words]u16);
+
+var time_buf_f32 = @zeros([3]f32);
+var ptr_time_memcpy: [*]f32 = &time_buf_f32;
+
+var tscRefBuffer = @zeros([timestamp.tsc_size_words]u16);
+var time_ref_f32 = @zeros([2]f32);
+var ptr_time_ref: [*]f32 = &time_ref_f32;
+
+// ---------------------- Init ----------------------------- //
+
+fn init_task() void {
+    timestamp.enable_tsc();
+    mpi_x.init();
+    mpi_y.init();
+    px = mpi_x.pe_id;
+    py = mpi_y.pe_id;
+    sys_mod.unblock_cmd_stream();
+}
+
+// ---------------------- SUMMA Algorithm ------------------- //
+
+var step: u16 = 0;
+
+fn mm() void {
+    // Broadcasting PE sends from home tile; others receive into buffer
+    const Xp = if (px == step) @ptrcast([*]u32, &X_tile) else @ptrcast([*]u32, &X_buffer);
+    const Wp = if (py == step) @ptrcast([*]u32, &W_tile) else @ptrcast([*]u32, &W_buffer);
+    // Broadcast length in u32 words (f16 elements / 2)
+    mpi_x.broadcast(step, Xp, Mt * Kt / 2, x_task_id);
+    mpi_y.broadcast(step, Wp, Kt * Nt / 2, y_task_id);
+}
+
+task x_done() void {
+    @activate(compute_task_id);
+}
+
+task y_done() void {
+    @unblock(compute_task_id);
+}
+
+fn gemv_static_step_X(curW: f16) void {
+    @fmach(out_dest_dsr, out_src0_dsr, X_src1_dsr, curW);
+}
+
+task compute() void {
+    const Xp: [*]f16 = if (px == step) &X_tile else &X_buffer;
+    const Wp: [*]f16 = if (py == step) &W_tile else &W_buffer;
+
+    X_dsd = @set_dsd_base_addr(X_dsd, Xp);
+    W_dsd = @set_dsd_base_addr(W_dsd, Wp);
+
+    X_dsd = @set_dsd_length(X_dsd, @bitcast(u16, Mt));
+    W_dsd = @set_dsd_length(W_dsd, @bitcast(u16, Nt));
+
+    for (@range(i16, Kt)) |k| {
+        out_dsd = @set_dsd_base_addr(out_dsd, ptr_out);
+
+        @load_to_dsr(out_dest_dsr, out_dsd, .{ .save_address = true });
+        @load_to_dsr(out_src0_dsr, out_dsd, .{ .save_address = true });
+        @load_to_dsr(X_src1_dsr, X_dsd, .{ .save_address = false });
+        @map(gemv_static_step_X, W_dsd);
+
+        X_dsd = @increment_dsd_offset(X_dsd, Mt, f16);
+        W_dsd = @increment_dsd_offset(W_dsd, Nt, f16);
+    }
+
+    step += 1;
+    @block(compute_task_id);
+
+    if (step < P) {
+        mm();
+    } else {
+        step = 0;
+        summa_entry();
+    }
+}
+
+// ---------------------- Entry Point ------------------------- //
+
+var total_repeat_times: i16 = 1;
+var total_warmup_times: i16 = 0;
+
+var repeat_times: i16 = 0;
+
+fn summa_host(total_warmup_times_: i16, total_repeat_times_: i16) void {
+    total_repeat_times = total_repeat_times_;
+    total_warmup_times = total_warmup_times_;
+
+    repeat_times = 0;
+    step = 0;
+
+    summa_entry();
+}
+
+fn summa_entry() void {
+    if (repeat_times == total_repeat_times + total_warmup_times) {
+        exit();
+    } else {
+        if (repeat_times == total_warmup_times) {
+            timestamp.get_timestamp(&tscRefBuffer);
+            timestamp.get_timestamp(&tscStartBuffer);
+        }
+
+        repeat_times += 1;
+
+        // Zero the result tile for each iteration
+        @fmovh(res_dsd, 0.0);
+        ptr_out = &res_tile;
+
+        mm();
+    }
+}
+
+fn exit() void {
+    timestamp.get_timestamp(&tscEndBuffer);
+    timestamp.disable_tsc();
+
+    f_reference_timestamps();
+    f_memcpy_timestamps();
+    sys_mod.unblock_cmd_stream();
+}
+
+fn f_memcpy_timestamps() void {
+    var lo_ : u16 = 0;
+    var hi_ : u16 = 0;
+    var word : u32 = 0;
+
+    lo_ = tscStartBuffer[0];
+    hi_ = tscStartBuffer[1];
+    time_buf_f32[0] = @bitcast(f32, (@as(u32,hi_) << @as(u16,16)) | @as(u32, lo_) );
+
+    lo_ = tscStartBuffer[2];
+    hi_ = tscEndBuffer[0];
+    time_buf_f32[1] = @bitcast(f32, (@as(u32,hi_) << @as(u16,16)) | @as(u32, lo_) );
+
+    lo_ = tscEndBuffer[1];
+    hi_ = tscEndBuffer[2];
+    time_buf_f32[2] = @bitcast(f32, (@as(u32,hi_) << @as(u16,16)) | @as(u32, lo_) );
+}
+
+fn f_reference_timestamps() void {
+    var lo_ : u16 = 0;
+    var hi_ : u16 = 0;
+
+    lo_ = tscRefBuffer[0];
+    hi_ = tscRefBuffer[1];
+    time_ref_f32[0] = @bitcast(f32, (@as(u32,hi_) << @as(u16,16)) | @as(u32, lo_) );
+
+    lo_ = tscRefBuffer[2];
+    hi_ = 0;
+    time_ref_f32[1] = @bitcast(f32, (@as(u32,hi_) << @as(u16,16)) | @as(u32, lo_) );
+}
+
+comptime {
+    @export_symbol(ptr_time_memcpy, "time_memcpy");
+    @export_symbol(ptr_time_ref, "time_ref");
+}
+
+comptime {
+    @bind_local_task(compute, compute_task_id);
+    @bind_local_task(x_done, x_task_id);
+    @bind_local_task(y_done, y_task_id);
+    @block(compute_task_id);
+
+    @export_symbol(ptr_X, "X");
+    @export_symbol(ptr_W, "W");
+    @export_symbol(ptr_res, "res");
+
+    @export_symbol(init_task);
+    @export_symbol(summa_entry);
+    @export_symbol(summa_host);
+}

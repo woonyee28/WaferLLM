@@ -1,0 +1,61 @@
+// Color/ task ID map
+//
+//  ID var              ID var              ID var                ID var
+//   0 c2d_x_color_0     9 c2d_x_entrypt_1  18                    27 reserved (memcpy)
+//   1 c2d_x_color_1    10 c2d_y_entrypt_0  19                    28 reserved (memcpy)
+//   2                  11 c2d_y_entrypt_1  20                    29 reserved
+//   3                  12                  21 reserved (memcpy)  30 reserved (memcpy)
+//   4 c2d_y_color_0    13 compute_task_id  22 reserved (memcpy)  31 reserved
+//   5 c2d_y_color_1    14 x_task_id        23 reserved (memcpy)  32
+//   6                  15 y_task_id        24                    33
+//   7                  16                  25                    34
+//   8 c2d_x_entrypt_0  17                  26                    35
+
+param P: i16;
+param Mt: i16;
+param Kt: i16;
+param Nt: i16;
+
+const memcpy = @import_module("<memcpy/get_params>", .{
+    .width = P,
+    .height = P,
+});
+
+const c2d = @import_module("<collectives_2d/params>");
+
+layout {
+    @set_rectangle(P, P);
+
+    var Px: i16 = 0;
+    while (Px < P) : (Px += 1) {
+        const memcpy_params = memcpy.get_params(Px);
+
+        var Py: i16 = 0;
+        while (Py < P) : (Py += 1) {
+            const c2d_params = c2d.get_params(Px, Py, .{
+                .x_colors      = .{ @get_color(0),          @get_color(1) },
+                .x_entrypoints = .{ @get_local_task_id(8),  @get_local_task_id(9) },
+                .y_colors      = .{ @get_color(4),          @get_color(5) },
+                .y_entrypoints = .{ @get_local_task_id(10), @get_local_task_id(11) },
+            });
+            @set_tile_code(Px, Py, "summa.csl", .{
+                .memcpy_params = memcpy_params,
+                .c2d_params = c2d_params,
+                .Mt = Mt, .Kt = Kt, .Nt = Nt,
+            });
+        }
+    }
+
+    @export_name("X", [*]f16, true);
+    @export_name("W", [*]f16, true);
+    @export_name("res", [*]f16, true);
+
+    @export_name("init_task", fn()void);
+    @export_name("summa_entry", fn()void);
+    @export_name("summa_host", fn(i16, i16)void);
+
+    @export_name("time_memcpy", [*]f32, true);
+    @export_name("time_ref", [*]f32, true);
+    @export_name("f_memcpy_timestamps", fn()void);
+    @export_name("f_reference_timestamps", fn()void);
+}
