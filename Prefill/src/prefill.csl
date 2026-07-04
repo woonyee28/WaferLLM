@@ -1102,7 +1102,9 @@ comptime {
     @export_symbol(ptr_UP_weight, "UP_weight");
     @export_symbol(ptr_GATE_weight, "GATE_weight");
     @export_symbol(ptr_DOWN_weight, "DOWN_weight");
-
+    // wyn: export Z
+    @export_symbol(ptr_Z, "Z");   // layer output after all processing
+    // wyn: end
     @export_symbol(init_task);
     @export_symbol(prefill_host);
 }

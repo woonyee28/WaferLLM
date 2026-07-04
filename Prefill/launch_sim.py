@@ -14,6 +14,15 @@ def float_to_hex(f):
 def make_u48(words):
     return words[0] + (words[1] << 16) + (words[2] << 32)
 
+# wyn: add function to untile the processed Z
+def untile_flat_1d(input_flat_1d, P, seq_len_p_pe, dim_p_pe):
+    # On each PE, it stores (seq_len_p_pe,dim_p_pe)
+    # d2h copy will return flat array in row major.
+    a = input_flat_1d.reshape(P, P, dim_p_pe, seq_len_p_pe)  # py=seq-block, px=dim-block
+    a = a.transpose(0, 3, 1, 2)  # (py, s_local, px, d_local)
+    return a.reshape(seq_len_p_pe * P, dim_p_pe * P) # (seq_len, dim)
+# wyn: end
+
 def assignId(pc, P):
     send_id = 0
     recv_id = 0
@@ -267,7 +276,16 @@ def main():
     runner.memcpy_d2h(time_ref_1d_f32, symbol_time_ref, 0, 0, P, P, 2, streaming=False,
                     order=MemcpyOrder.ROW_MAJOR, data_type=MemcpyDataType.MEMCPY_32BIT, nonblock=False)
     time_ref_hwl = np.reshape(time_ref_1d_f32, (P, P, 2), order='C')
-    
+
+    # wyn: read back the layer output Z, after all processing for baseline verification.
+    sym_Z = runner.get_id("Z")
+    Z_1d = np.zeros(P * P * seq_len_p_pe * dim_p_pe, dtype=np.float16)
+    runner.memcpy_d2h(Z_1d, sym_Z, 0, 0, P, P, seq_len_p_pe * dim_p_pe,
+                      streaming=False, order=memcpy_order, data_type=io_dtype, nonblock=False)
+    Z_layer0 = untile_flat_1d(Z_1d, P, seq_len_p_pe, dim_p_pe)   # (seq_len, dim)
+    np.save("csl_layer0_output.npy", Z_layer0)
+    # wyn: end
+
     runner.stop()
     
     time_start = np.zeros((P, P)).astype(int)
