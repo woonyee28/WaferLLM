@@ -76,6 +76,40 @@ def parse_args():
     args = parser.parse_args()
     return args
 
+# wyn: load real Meta-Llama-3-8B block-0 weights from the safetensors checkpoint.
+# HF Linear stores weights as [out, in] and applies x @ W.T; WaferLLM does x @ W,
+# so the 2-D projection weights are transposed. The 1-D norm weights are left as-is.
+def load_block0_weights():
+    import glob, torch
+    from safetensors import safe_open
+
+    model_dir = "/home/woonyee/.cache/huggingface/hub/models--meta-llama--Meta-Llama-3-8B"
+    prefix = "model.layers.0."
+
+    raw = {}
+    for shard in sorted(glob.glob(os.path.join(model_dir, "**", "*.safetensors"), recursive=True)):
+        with safe_open(shard, framework="pt") as f:
+            for name in f.keys():
+                if name.startswith(prefix):
+                    raw[name] = f.get_tensor(name).to(torch.float32).cpu().numpy().astype(np.float16)
+
+    def get(suffix, transpose=True):
+        w = raw[prefix + suffix]
+        return w.T if transpose else w
+
+    return {
+        "q"        : get("self_attn.q_proj.weight"),
+        "k"        : get("self_attn.k_proj.weight"),
+        "v"        : get("self_attn.v_proj.weight"),
+        "o"        : get("self_attn.o_proj.weight"),
+        "up"       : get("mlp.up_proj.weight"),
+        "gate"     : get("mlp.gate_proj.weight"),
+        "down"     : get("mlp.down_proj.weight"),
+        "norm_pre" : get("input_layernorm.weight", transpose=False),
+        "norm_post": get("post_attention_layernorm.weight", transpose=False),
+    }
+# wyn: end
+
 def main():
     args = parse_args()
     config = Config()
@@ -102,24 +136,39 @@ def main():
     io_dtype = MemcpyDataType.MEMCPY_16BIT
     memcpy_order = MemcpyOrder.ROW_MAJOR
     
-    tensor_X = np.random.rand(seq_len, dim).astype(np.float16)
-    
-    W = np.random.rand(1, dim).astype(np.float16)
+    # wyn: real Llama-3-8B block-0 weights + input X (baseline.py dump) instead of random.
+    weights = load_block0_weights()
+
+    # input X = block-0 resid_pre, zero-padded up to seq_len (which must be a multiple of P)
+    resid_dir = "/home/woonyee/Cerebras/pytorch"
+    resid_pre = np.load(os.path.join(resid_dir, "resid_pre_block0.npy")).astype(np.float16)  # [n_tok, dim]
+    # check the current prompt length
+    n_tok = resid_pre.shape[0]
+    # if too long then increase the seq_len in the config.json
+    assert n_tok <= seq_len, f"prompt has {n_tok} tokens > seq_len {seq_len}; raise seq_len in the config"
+    # allocate the full size input the kernel expects: [128,4096], all zeros at first.
+    tensor_X = np.zeros((seq_len, dim), dtype=np.float16)
+    tensor_X[:n_tok] = resid_pre
+
+    W = weights["norm_pre"].reshape(1, dim)
     tensor_W = np.tile(W.reshape(P, dim_p_pe), reps=(1, P))
-    
-    tensor_q_weight = np.random.rand(dim, dim).astype(np.float16)
-    tensor_k_weight = np.random.rand(dim, dim).astype(np.float16)
-    tensor_v_weight = np.random.rand(dim, dim).astype(np.float16)
+
+    tensor_q_weight = weights["q"]
+    tensor_k_weight = weights["k"]
+    tensor_v_weight = weights["v"]
+    # wyn: end
 
     freqs_sin = np.random.rand(1, P*_dim_p_pe//2).astype(np.float16)
     tensor_freqs_sin = np.tile(freqs_sin.reshape(P, _dim_p_pe//2), reps=(1, P))
     freqs_cos = np.random.rand(1, P*_dim_p_pe//2).astype(np.float16)
     tensor_freqs_cos = np.tile(freqs_cos.reshape(P, _dim_p_pe//2), reps=(1, P))
 
-    tensor_o_weight = np.random.rand(dim, dim).astype(np.float16)
-    tensor_up_weight = np.random.rand(dim, ffn_dim).astype(np.float16)
-    tensor_gate_weight = np.random.rand(dim, ffn_dim).astype(np.float16)
-    tensor_down_weight = np.random.rand(ffn_dim, dim).astype(np.float16)
+    # wyn: real block-0 weights (loaded above)
+    tensor_o_weight = weights["o"]
+    tensor_up_weight = weights["up"]
+    tensor_gate_weight = weights["gate"]
+    tensor_down_weight = weights["down"]
+    # wyn: end
     
     ind = np.zeros((P, P)).astype(int)
     
@@ -284,6 +333,14 @@ def main():
                       streaming=False, order=memcpy_order, data_type=io_dtype, nonblock=False)
     Z_layer0 = untile_flat_1d(Z_1d, P, seq_len_p_pe, dim_p_pe)   # (seq_len, dim)
     np.save("csl_layer0_output.npy", Z_layer0)
+
+    # diff against transformer_lens block-0 resid_post (real token rows only; padded rows ignored)
+    resid_post = np.load(os.path.join(resid_dir, "resid_post_block0.npy")).astype(np.float32)
+    got = Z_layer0[:resid_post.shape[0]].astype(np.float32)
+    abs_err = np.abs(got - resid_post)
+    tol = 2e-2
+    ok = np.all(abs_err <= tol + tol * np.abs(resid_post))
+    print(f"[diff vs resid_post] max_abs={abs_err.max():.4e} mean_abs={abs_err.mean():.4e} -> {'PASS' if ok else 'FAIL'}")
     # wyn: end
 
     runner.stop()
