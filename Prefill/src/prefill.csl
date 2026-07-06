@@ -115,6 +115,11 @@ var W_tile: [dim_p_pe]f16 = @zeros([dim_p_pe]f16);
 var ptr_W: [*]f16 = &W_tile;
 var W_dsd = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{dim_p_pe} -> W_tile[i] });
 
+// wyn: second RMSNorm weight (post_attention_layernorm), used by rmsnorm_z (pre-FFN norm)
+var W2_tile: [dim_p_pe]f16 = @zeros([dim_p_pe]f16);
+var ptr_W2: [*]f16 = &W2_tile;
+// wyn: end
+
 // * Q_weight, K_weight, V_weight: QKV weights input
 var Q_weight_tile: [dim_p_pe * dim_p_pe]f16 = @zeros([dim_p_pe * dim_p_pe]f16);
 var ptr_Q_weight: [*]f16 = &Q_weight_tile;
@@ -820,7 +825,9 @@ fn rmsnorm_z() void {
     @load_to_dsr(comp_src0_dsr_1, seqLen_dsd_2, .{ .save_address = true });
 
     for (@range(i16, dim_p_pe)) |i| {
-        @fmulh(comp_dest_dsr_1, comp_src0_dsr_1, W_tile[i]);
+        // wyn: pre-FFN norm uses the post_attention_layernorm weight (W2), not W
+        @fmulh(comp_dest_dsr_1, comp_src0_dsr_1, W2_tile[i]);
+        // wyn: end
     }
 
     seqLen_dsd_1 = @set_dsd_base_addr(seqLen_dsd_1, ptr_Z_norm);
@@ -1106,6 +1113,9 @@ comptime {
 comptime {
     @export_symbol(ptr_X, "X");
     @export_symbol(ptr_W, "W");
+    // wyn: post-attention norm weight (rmsnorm_z)
+    @export_symbol(ptr_W2, "W2");
+    // wyn: end
     @export_symbol(ptr_Q_weight, "Q_weight");
     @export_symbol(ptr_K_weight, "K_weight");
     @export_symbol(ptr_V_weight, "V_weight");

@@ -151,6 +151,11 @@ def main():
     W = weights["norm_pre"].reshape(1, dim)
     tensor_W = np.tile(W.reshape(P, dim_p_pe), reps=(1, P))
 
+    # wyn: second norm weight (post_attention_layernorm) for rmsnorm_z
+    W2 = weights["norm_post"].reshape(1, dim)
+    tensor_W2 = np.tile(W2.reshape(P, dim_p_pe), reps=(1, P))
+    # wyn: end
+
     tensor_q_weight = weights["q"]
     tensor_k_weight = weights["k"]
     tensor_v_weight = weights["v"]
@@ -210,6 +215,7 @@ def main():
         
         sym_X = runner.get_id("X")
         sym_W = runner.get_id("W")
+        sym_W2 = runner.get_id("W2")  # wyn: post-attention norm
         sym_Q_weight = runner.get_id("Q_weight")
         sym_K_weight = runner.get_id("K_weight")
         sym_V_weight = runner.get_id("V_weight")
@@ -234,7 +240,14 @@ def main():
         runner.memcpy_h2d(
             sym_W, W_u32, 0, 0, P, P, dim_p_pe, streaming=False, data_type=io_dtype, order=memcpy_order, nonblock=False
         )
-        
+
+        # wyn: send the post-attention norm weight
+        W2_u32 = cast_tensor_u32(tensor_W2.ravel())
+        runner.memcpy_h2d(
+            sym_W2, W2_u32, 0, 0, P, P, dim_p_pe, streaming=False, data_type=io_dtype, order=memcpy_order, nonblock=False
+        )
+        # wyn: end
+
         Q_reshape = tensor_q_weight_shifted.reshape(P, dim_p_pe, P, dim_p_pe)
         Q_transpose = Q_reshape.transpose(0, 2, 1, 3)
         Q_reshape = Q_transpose.reshape(P, P, dim_p_pe * dim_p_pe)

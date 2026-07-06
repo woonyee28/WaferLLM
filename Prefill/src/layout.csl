@@ -255,6 +255,9 @@ layout {
 
     @export_name("X", [*]f16, true);
     @export_name("W", [*]f16, true);
+    // wyn: second norm weight (post_attention_layernorm)
+    @export_name("W2", [*]f16, true);
+    // wyn: end
     @export_name("Q_weight", [*]f16, true);
     @export_name("K_weight", [*]f16, true);
     @export_name("V_weight", [*]f16, true);
