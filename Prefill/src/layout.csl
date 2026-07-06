@@ -82,6 +82,9 @@ layout {
                     .bd_color = C_BD,
                 },
                 .P = P, .dim_p_pe = dim_p_pe, .seq_len_p_pe = seq_len_p_pe, .ffn_dim_p_pe = ffn_dim_p_pe,
+                // wyn: forward GQA head params so per-head attention can slice by head
+                .pes_p_head = pes_p_head, .pes_p_kv_head = pes_p_kv_head, .head_dim_p_pe = head_dim_p_pe,
+                // wyn: end
             });
 
             {
@@ -178,6 +181,9 @@ layout {
                     .bd_color = C_BD,
                 },
                 .P = P, .dim_p_pe = dim_p_pe, .seq_len_p_pe = seq_len_p_pe, .ffn_dim_p_pe = ffn_dim_p_pe,
+                // wyn: forward GQA head params so per-head attention can slice by head
+                .pes_p_head = pes_p_head, .pes_p_kv_head = pes_p_kv_head, .head_dim_p_pe = head_dim_p_pe,
+                // wyn: end
             });
 
             {
