@@ -12,6 +12,9 @@ param head_dim_p_pe: i16;
 // wyn: end
 
 const eps: f16 = 0.000001;
+// wyn: causal-mask fill value (in fp16, exp(−10000) underflows to exactly 0)
+const neg_inf: f16 = -1.0e4;
+// wyn: end
 var alpha: f16 = 0.0;
 
 const _dim_p_pe: i16 = (dim_p_pe / 2) * 2;
@@ -656,6 +659,18 @@ fn softmax_score() void {
     @load_to_dsr(comp_dest_dsr_1, score_dsd);
     @load_to_dsr(comp_src0_dsr_1, score_dsd);
     @fmulh(comp_dest_dsr_1, comp_src0_dsr_1, alpha);
+
+    // wyn: causal mask. score is laid out [key_local outer, query_local inner]; this PE holds
+    // key block px and query block py, so global key = px*sp+kl, global query = py*sp+ql.
+    // Set future positions (key > query) to neg_inf so they contribute 0 after softmax.
+    for (@range(i16, seq_len_p_pe)) |kl| {
+        for (@range(i16, seq_len_p_pe)) |ql| {
+            if (px * seq_len_p_pe + kl > py * seq_len_p_pe + ql) {
+                score[kl * seq_len_p_pe + ql] = neg_inf;
+            }
+        }
+    }
+    // wyn: end
 
     @load_to_dsr(comp_dest_dsr_1, local_max_dsd, .{ .save_address = false});
     @fmovh(comp_dest_dsr_1, 0.0); // Clearing
