@@ -27,7 +27,7 @@ def untile_flat_1d(input_flat_1d, P, seq_len_p_pe, dim_p_pe):
 # wyn: load real Meta-Llama-3-8B block-0 weights from the safetensors checkpoint.
 # HF Linear stores weights as [out, in] and applies x @ W.T; WaferLLM does x @ W,
 # so the 2-D projection weights are transposed. The 1-D norm weights are left as-is.
-def load_block0_weights():
+def load_block0_weights(head_dim, n_heads, n_kv_heads):
     import glob, torch
     from safetensors import safe_open
 
@@ -45,9 +45,22 @@ def load_block0_weights():
         w = raw[prefix + suffix]
         return w.T if transpose else w
 
+    # wyn: RoPE convention fix. HF uses rotate-half (pairs dim i with i+D/2); the kernel rotates
+    # ADJACENT pairs (2i, 2i+1). Permuting q/k output columns per head so kernel col 2i <- HF col
+    # i+D/2 and col 2i+1 <- HF col i makes the kernel's rope reproduce HF's rope exactly. Q and K
+    # get the same permutation, so attention scores (a dot product over dim) are unchanged; V/O are
+    # not roped, so they stay as-is.
+    def rope_perm(w, D, n):
+        half = D // 2
+        p = np.empty(D, dtype=np.int64)
+        p[0::2] = np.arange(half) + half   # even kernel cols <- HF second half x[i+D/2]
+        p[1::2] = np.arange(half)          # odd  kernel cols <- HF first half  x[i]
+        full = np.concatenate([h * D + p for h in range(n)])
+        return w[:, full]
+
     return {
-        "q"        : get("self_attn.q_proj.weight"),
-        "k"        : get("self_attn.k_proj.weight"),
+        "q"        : rope_perm(get("self_attn.q_proj.weight"), head_dim, n_heads),
+        "k"        : rope_perm(get("self_attn.k_proj.weight"), head_dim, n_kv_heads),
         "v"        : get("self_attn.v_proj.weight"),
         "o"        : get("self_attn.o_proj.weight"),
         "up"       : get("mlp.up_proj.weight"),
@@ -125,6 +138,7 @@ def main():
     dim = config.dim
     seq_len = config.seq_len
     ffn_dim = config.ffn_dim
+    head_dim = config.head_dim  # wyn: needed for RoPE freqs + q/k permutation
     
     dim_p_pe = dim // P
     seq_len_p_pe = seq_len // P
@@ -139,7 +153,7 @@ def main():
     
     # wyn: real Llama-3-8B block-0 weights (safetensors) + input X = block-0 resid_pre
     # (baseline.py dump), zero-padded up to seq_len (a multiple of P).
-    weights = load_block0_weights()
+    weights = load_block0_weights(head_dim, config.n_heads, config.n_kv_heads)
 
     resid_dir = "/home/woonyee/Cerebras/pytorch"
     resid_pre = np.load(os.path.join(resid_dir, "resid_pre_block0.npy")).astype(np.float16)  # [n_tok, dim]
@@ -160,10 +174,24 @@ def main():
     tensor_k_weight = weights["k"]
     tensor_v_weight = weights["v"]
 
-    freqs_sin = np.random.rand(1, P*_dim_p_pe//2).astype(np.float16)
-    tensor_freqs_sin = np.tile(freqs_sin.reshape(P, _dim_p_pe//2), reps=(1, P))
-    freqs_cos = np.random.rand(1, P*_dim_p_pe//2).astype(np.float16)
-    tensor_freqs_cos = np.tile(freqs_cos.reshape(P, _dim_p_pe//2), reps=(1, P))
+    # wyn: real RoPE tables (theta=500000), one freq vector per PE.
+    # Assumes seq_len_p_pe == 1, so mesh row py IS the sequence position p.
+    # For PE(px,py) local pair l: within-head pair index i = (px % (head_dim//dim_p_pe))
+    # * (dim_p_pe//2) + l; angle = p * theta^(-2i/head_dim). Head-periodic; matches HF
+    # once q/k are rope-permuted (see load_block0_weights).
+    assert seq_len_p_pe == 1, "real RoPE freq gen assumes seq_len_p_pe == 1"
+    theta = 500000.0
+    npairs = _dim_p_pe // 2
+    pe_per_head = head_dim // dim_p_pe
+    tensor_freqs_cos = np.zeros((P, P, npairs), dtype=np.float16)
+    tensor_freqs_sin = np.zeros((P, P, npairs), dtype=np.float16)
+    for py in range(P):
+        for px in range(P):
+            for l in range(npairs):
+                i = (px % pe_per_head) * (dim_p_pe // 2) + l
+                angle = py * (theta ** (-2.0 * i / head_dim))
+                tensor_freqs_cos[py, px, l] = np.cos(angle)
+                tensor_freqs_sin[py, px, l] = np.sin(angle)
 
     tensor_o_weight = weights["o"]
     tensor_up_weight = weights["up"]
