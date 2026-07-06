@@ -4,7 +4,7 @@ import struct
 import os
 import json
 
-from cerebras.sdk.sdk_utils import input_array_to_u32
+from cerebras.sdk.sdk_utils import input_array_to_u32, memcpy_view
 from cerebras.sdk.runtime.sdkruntimepybind import SdkRuntime
 from cerebras.sdk.runtime.sdkruntimepybind import MemcpyDataType, MemcpyOrder
 
@@ -291,10 +291,12 @@ def main():
     time_ref_hwl = np.reshape(time_ref_1d_f32, (P, P, 2), order='C')
 
     # wyn: read back the layer output Z, after all processing for baseline verification.
+    # memcpy transfers must use a 32-bit buffer; unpack the fp16 values with memcpy_view.
     sym_Z = runner.get_id("Z")
-    Z_1d = np.zeros(P * P * seq_len_p_pe * dim_p_pe, dtype=np.float16)
-    runner.memcpy_d2h(Z_1d, sym_Z, 0, 0, P, P, seq_len_p_pe * dim_p_pe,
+    Z_1d_u32 = np.zeros(P * P * seq_len_p_pe * dim_p_pe, dtype=np.uint32)
+    runner.memcpy_d2h(Z_1d_u32, sym_Z, 0, 0, P, P, seq_len_p_pe * dim_p_pe,
                       streaming=False, order=memcpy_order, data_type=io_dtype, nonblock=False)
+    Z_1d = memcpy_view(Z_1d_u32, np.dtype(np.float16))
     Z_layer0 = untile_flat_1d(Z_1d, P, seq_len_p_pe, dim_p_pe)   # (seq_len, dim)
     np.save("csl_layer0_output.npy", Z_layer0)
     # wyn: end
