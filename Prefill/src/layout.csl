@@ -264,6 +264,9 @@ layout {
     @export_name("UP_weight", [*]f16, true);
     @export_name("GATE_weight", [*]f16, true);
     @export_name("DOWN_weight", [*]f16, true);
+    // wyn: layer output Z, read back by host for verification (matches @export_symbol in prefill.csl)
+    @export_name("Z", [*]f16, true);
+    // wyn: end
 
     @export_name("init_task", fn()void);
     @export_name("prefill_host", fn(i16, i16)void);
