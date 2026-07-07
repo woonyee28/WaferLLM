@@ -170,6 +170,10 @@ var ptr_DOWN_weight: [*]f16 = &DOWN_weight_tile;
 var X_norm_tile: [seq_len_p_pe * dim_p_pe]f16 = @zeros([seq_len_p_pe * dim_p_pe]f16);
 var ptr_X_norm: [*]f16 = &X_norm_tile;
 
+// wyn: pristine copy of X_norm. Each head's projection pre-shifts X_norm in place, so we restore
+// this backup before every head — all heads then project the SAME input through their own weights.
+var X_norm_backup: [seq_len_p_pe * dim_p_pe]f16 = @zeros([seq_len_p_pe * dim_p_pe]f16);
+
 // * XQ, XK, XV: per-head QKV in prefill. One head fills the mesh: head_dim across all P
 // columns (head_dim_p_pe per PE), so each tile is [seq_len_p_pe * head_dim_p_pe].
 var XQ_tile: [seq_len_p_pe * head_dim_p_pe]f16 = @zeros([seq_len_p_pe * head_dim_p_pe]f16);
@@ -490,10 +494,20 @@ fn rmsnorm_x() void {
         @fmulh(comp_dest_dsr_1, comp_src0_dsr_1, local_sum[i]);
     }
 
+    // wyn: stash pristine X_norm for the per-head loop to restore before each head's pre-shift
+    for (@range(i16, seq_len_p_pe * dim_p_pe)) |i| {
+        X_norm_backup[i] = X_norm_tile[i];
+    }
+
     prefill_struct();
 }
 
 fn xq_matmul() void {
+
+    // wyn: restore pristine X_norm — the previous head's pre-shift/projections left it shifted in place
+    for (@range(i16, seq_len_p_pe * dim_p_pe)) |i| {
+        X_norm_tile[i] = X_norm_backup[i];
+    }
 
     // Clearing
     @load_to_dsr(comp_dest_dsr_1, XQ_dsd);
