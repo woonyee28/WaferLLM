@@ -255,6 +255,12 @@ var Z_tile: [seq_len_p_pe * dim_p_pe]f16 = @zeros([seq_len_p_pe * dim_p_pe]f16);
 var ptr_Z: [*]f16 = &Z_tile;
 var Z_dsd = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{seq_len_p_pe * dim_p_pe} -> Z_tile[i] });
 
+// wyn: post-attention residual (Z = X + attn, before FFN) = Llama resid_mid. Snapshotted in
+// z_add and read back by the host to validate attention independently of the FFN.
+var Z_mid_tile: [seq_len_p_pe * dim_p_pe]f16 = @zeros([seq_len_p_pe * dim_p_pe]f16);
+var ptr_Z_mid: [*]f16 = &Z_mid_tile;
+var Z_mid_dsd = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{seq_len_p_pe * dim_p_pe} -> Z_mid_tile[i] });
+
 var swap_ptr: [*]f16;
 var ptr_left_matrix_send: [*]f16;
 var ptr_left_matrix_recv: [*]f16;
@@ -879,6 +885,9 @@ fn z_add() void {
     @load_to_dsr(comp_src1_dsr_1, h1_dsd);
     @faddh(comp_dest_dsr_1, comp_src0_dsr_1, comp_src1_dsr_1);
 
+    // wyn: snapshot the post-attention residual (resid_mid) before the FFN overwrites Z
+    @fmovh(Z_mid_dsd, Z_dsd);
+
     prefill_struct();
 }
 
@@ -1233,6 +1242,7 @@ comptime {
     @export_symbol(ptr_DOWN_weight, "DOWN_weight");
     // wyn: export Z
     @export_symbol(ptr_Z, "Z");   // layer output after all processing
+    @export_symbol(ptr_Z_mid, "Z_mid");   // wyn: post-attention residual (resid_mid)
     // wyn: end
     @export_symbol(init_task);
     @export_symbol(prefill_host);

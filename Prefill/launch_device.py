@@ -399,6 +399,14 @@ def main():
                           streaming=False, order=memcpy_order, data_type=io_dtype, nonblock=False)
         Z_1d = sdk_utils.memcpy_view(Z_1d_u32, np.dtype(np.float16))
         Z_layer0 = untile_flat_1d(Z_1d, P, seq_len_p_pe, dim_p_pe)   # (seq_len, dim)
+
+        # wyn: also read the post-attention residual (resid_mid) for attention-only validation
+        sym_Z_mid = runner.get_id("Z_mid")
+        Zmid_1d_u32 = np.zeros(P * P * seq_len_p_pe * dim_p_pe, dtype=np.uint32)
+        runner.memcpy_d2h(Zmid_1d_u32, sym_Z_mid, 0, 0, P, P, seq_len_p_pe * dim_p_pe,
+                          streaming=False, order=memcpy_order, data_type=io_dtype, nonblock=False)
+        Zmid_1d = sdk_utils.memcpy_view(Zmid_1d_u32, np.dtype(np.float16))
+        Zmid_layer0 = untile_flat_1d(Zmid_1d, P, seq_len_p_pe, dim_p_pe)   # (seq_len, dim)
         # wyn: end
 
     time_start = np.zeros((P, P)).astype(int)
@@ -447,14 +455,21 @@ def main():
     time = (max_time_end - min_time_start) / total_repeat_times / (freq_ghz*1e6)
     print(f"Time: {time} ms")
 
-    # wyn: diff kernel Z against transformer_lens block-0 resid_post (real token rows only)
-    resid_post = np.load(os.path.join(resid_dir, "resid_post_block0.npy")).astype(np.float32)
-    got = Z_layer0[:resid_post.shape[0]].astype(np.float32)
-    abs_err = np.abs(got - resid_post)
+    # wyn: diff kernel outputs against transformer_lens block-0 residuals (real token rows only).
+    # resid_mid (attention only) is independent of ffn_dim, so it validates GQA/rope/causal/norm
+    # even on a truncated-FFN build. resid_post is the full layer (needs the real ffn_dim).
     tol = 2e-2
-    ok = np.all(abs_err <= tol + tol * np.abs(resid_post))
-    print(f"[diff vs resid_post] max_abs={abs_err.max():.4e} mean_abs={abs_err.mean():.4e} -> {'PASS' if ok else 'FAIL'}")
+    def report(name, got_full, ref_path):
+        ref = np.load(os.path.join(resid_dir, ref_path)).astype(np.float32)
+        got = got_full[:ref.shape[0]].astype(np.float32)
+        abs_err = np.abs(got - ref)
+        ok = np.all(abs_err <= tol + tol * np.abs(ref))
+        print(f"[diff vs {name}] max_abs={abs_err.max():.4e} mean_abs={abs_err.mean():.4e} -> {'PASS' if ok else 'FAIL'}")
+
+    report("resid_mid", Zmid_layer0, "resid_mid_block0.npy")
+    report("resid_post", Z_layer0, "resid_post_block0.npy")
     np.save("csl_layer0_output.npy", Z_layer0)
+    np.save("csl_layer0_resid_mid.npy", Zmid_layer0)
     # wyn: end
 
 if __name__ == "__main__":
