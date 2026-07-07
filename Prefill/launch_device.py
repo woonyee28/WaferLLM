@@ -143,7 +143,8 @@ def main():
     dim_p_pe = dim // P
     seq_len_p_pe = seq_len // P
     ffn_dim_p_pe = ffn_dim // P
-    
+    head_dim_p_pe = head_dim // P  # wyn: per-head tile size (per-head projections + freqs)
+
     _dim_p_pe = dim_p_pe
     if (dim_p_pe % 2) == 1:
         _dim_p_pe = dim_p_pe - 1
@@ -179,16 +180,20 @@ def main():
     # For PE(px,py) local pair l: within-head pair index i = (px % (head_dim//dim_p_pe))
     # * (dim_p_pe//2) + l; angle = p * theta^(-2i/head_dim). Head-periodic; matches HF
     # once q/k are rope-permuted (see load_block0_weights).
+    # PER-HEAD layout: a head's head_dim is spread across all P columns (head_dim_p_pe per PE),
+    # and the kernel ropes head_dim_p_pe/2 pairs per PE. PE px holds within-head pairs
+    # [px*half : (px+1)*half]. p = py (seq_len_p_pe == 1). Buffer width stays _dim_p_pe//2 (kernel
+    # tile size); only the first `half` entries per PE are read. Matches HF after rope_perm.
     assert seq_len_p_pe == 1, "real RoPE freq gen assumes seq_len_p_pe == 1"
     theta = 500000.0
-    npairs = _dim_p_pe // 2
-    pe_per_head = head_dim // dim_p_pe
+    npairs = _dim_p_pe // 2          # freqs buffer width per PE (memcpy size)
+    half = head_dim_p_pe // 2         # per-head pairs actually used per PE
     tensor_freqs_cos = np.zeros((P, P, npairs), dtype=np.float16)
     tensor_freqs_sin = np.zeros((P, P, npairs), dtype=np.float16)
     for py in range(P):
         for px in range(P):
-            for l in range(npairs):
-                i = (px % pe_per_head) * (dim_p_pe // 2) + l
+            for l in range(half):
+                i = px * half + l    # within-head pair index (0..head_dim/2-1)
                 angle = py * (theta ** (-2.0 * i / head_dim))
                 tensor_freqs_cos[py, px, l] = np.cos(angle)
                 tensor_freqs_sin[py, px, l] = np.sin(angle)
@@ -213,27 +218,52 @@ def main():
                 else:
                     ind[i, j], _ = assignId(ind[i-2, j], P)
                     
-    tensor_q_weight_shifted = np.zeros((dim, dim)).astype(np.float16)
-    tensor_k_weight_shifted = np.zeros((dim, dim)).astype(np.float16)
-    tensor_v_weight_shifted = np.zeros((dim, dim)).astype(np.float16)
-    
-    tensor_o_weight_shifted = np.zeros((dim, dim)).astype(np.float16)
+    # wyn: per-head HEAD-MAJOR sharding for Q/K/V/O. Each head's block is laid so its head_dim
+    # output spans all P columns; the kernel reads head h at offset h*(per-head block size).
+    # ind[i,j] is the shifted contraction-block index (same permutation the FFN weights use).
+    #   Q/K/V: contract=dim (dim_p_pe rows), output=head_dim per head (head_dim_p_pe cols per PE).
+    #   O:     contract=head_dim per head (head_dim_p_pe rows), output=dim (dim_p_pe cols per PE).
+    def shard_qkv_headmajor(W, n_h):   # W: [dim, n_h*head_dim]
+        out = np.zeros((P, P, n_h * dim_p_pe * head_dim_p_pe), dtype=np.float16)
+        for i in range(P):
+            for j in range(P):
+                t = ind[i, j]
+                for h in range(n_h):
+                    blk = W[t*dim_p_pe:(t+1)*dim_p_pe,
+                            h*head_dim + j*head_dim_p_pe : h*head_dim + (j+1)*head_dim_p_pe]
+                    off = h * dim_p_pe * head_dim_p_pe
+                    out[i, j, off:off + dim_p_pe*head_dim_p_pe] = blk.reshape(-1)
+        return out
+
+    def shard_o_headmajor(Wo, n_h):    # Wo: [n_h*head_dim, dim]
+        out = np.zeros((P, P, n_h * head_dim_p_pe * dim_p_pe), dtype=np.float16)
+        for i in range(P):
+            for j in range(P):
+                t = ind[i, j]
+                for h in range(n_h):
+                    blk = Wo[h*head_dim + t*head_dim_p_pe : h*head_dim + (t+1)*head_dim_p_pe,
+                             j*dim_p_pe:(j+1)*dim_p_pe]
+                    off = h * head_dim_p_pe * dim_p_pe
+                    out[i, j, off:off + head_dim_p_pe*dim_p_pe] = blk.reshape(-1)
+        return out
+
+    q_hm = shard_qkv_headmajor(tensor_q_weight, config.n_heads)
+    k_hm = shard_qkv_headmajor(tensor_k_weight, config.n_kv_heads)
+    v_hm = shard_qkv_headmajor(tensor_v_weight, config.n_kv_heads)
+    o_hm = shard_o_headmajor(tensor_o_weight, config.n_heads)
+
+    # FFN weights keep the original full (non-per-head) sharding
     tensor_up_weight_shifted = np.zeros((dim, ffn_dim)).astype(np.float16)
     tensor_gate_weight_shifted = np.zeros((dim, ffn_dim)).astype(np.float16)
     tensor_down_weight_shifted = np.zeros((ffn_dim, dim)).astype(np.float16)
-    
+
     for i in range(P):
         for j in range(P):
             t = ind[i, j]
-            tensor_q_weight_shifted[i*dim_p_pe:(i+1)*dim_p_pe, j*dim_p_pe:(j+1)*dim_p_pe] = tensor_q_weight[t*dim_p_pe:(t+1)*dim_p_pe, j*dim_p_pe:(j+1)*dim_p_pe]
-            tensor_k_weight_shifted[i*dim_p_pe:(i+1)*dim_p_pe, j*dim_p_pe:(j+1)*dim_p_pe] = tensor_k_weight[t*dim_p_pe:(t+1)*dim_p_pe, j*dim_p_pe:(j+1)*dim_p_pe]
-            tensor_v_weight_shifted[i*dim_p_pe:(i+1)*dim_p_pe, j*dim_p_pe:(j+1)*dim_p_pe] = tensor_v_weight[t*dim_p_pe:(t+1)*dim_p_pe, j*dim_p_pe:(j+1)*dim_p_pe]
-            
-            tensor_o_weight_shifted[i*dim_p_pe:(i+1)*dim_p_pe, j*dim_p_pe:(j+1)*dim_p_pe] = tensor_o_weight[t*dim_p_pe:(t+1)*dim_p_pe, j*dim_p_pe:(j+1)*dim_p_pe]
             tensor_up_weight_shifted[i*dim_p_pe:(i+1)*dim_p_pe, j*ffn_dim_p_pe:(j+1)*ffn_dim_p_pe] = tensor_up_weight[t*dim_p_pe:(t+1)*dim_p_pe, j*ffn_dim_p_pe:(j+1)*ffn_dim_p_pe]
             tensor_gate_weight_shifted[i*dim_p_pe:(i+1)*dim_p_pe, j*ffn_dim_p_pe:(j+1)*ffn_dim_p_pe] = tensor_gate_weight[t*dim_p_pe:(t+1)*dim_p_pe, j*ffn_dim_p_pe:(j+1)*ffn_dim_p_pe]
             tensor_down_weight_shifted[i*ffn_dim_p_pe:(i+1)*ffn_dim_p_pe, j*dim_p_pe:(j+1)*dim_p_pe] = tensor_down_weight[t*ffn_dim_p_pe:(t+1)*ffn_dim_p_pe, j*dim_p_pe:(j+1)*dim_p_pe]
-            
+
     cfg_name = os.path.splitext(os.path.basename(args.config))[0]
     with open(f"{out_path}/artifact_{cfg_name}.json", "r", encoding="utf-8") as f:
         data = json.load(f)
@@ -276,28 +306,20 @@ def main():
         )
         # wyn: end
 
-        Q_reshape = tensor_q_weight_shifted.reshape(P, dim_p_pe, P, dim_p_pe)
-        Q_transpose = Q_reshape.transpose(0, 2, 1, 3)
-        Q_reshape = Q_transpose.reshape(P, P, dim_p_pe * dim_p_pe)
-        Q_u32 = cast_tensor_u32(Q_reshape.ravel())
+        # wyn: Q/K/V are already per-PE head-major [P, P, n_h*dim_p_pe*head_dim_p_pe]
+        Q_u32 = cast_tensor_u32(q_hm.ravel())
         runner.memcpy_h2d(
-            sym_Q_weight, Q_u32, 0, 0, P, P, dim_p_pe * dim_p_pe, streaming=False, data_type=io_dtype, order=memcpy_order, nonblock=False
+            sym_Q_weight, Q_u32, 0, 0, P, P, config.n_heads * dim_p_pe * head_dim_p_pe, streaming=False, data_type=io_dtype, order=memcpy_order, nonblock=False
         )
-        
-        K_reshape = tensor_k_weight_shifted.reshape(P, dim_p_pe, P, dim_p_pe)
-        K_transpose = K_reshape.transpose(0, 2, 1, 3)
-        K_reshape = K_transpose.reshape(P, P, dim_p_pe * dim_p_pe)
-        K_u32 = cast_tensor_u32(K_reshape.ravel())
+
+        K_u32 = cast_tensor_u32(k_hm.ravel())
         runner.memcpy_h2d(
-            sym_K_weight, K_u32, 0, 0, P, P, dim_p_pe * dim_p_pe, streaming=False, data_type=io_dtype, order=memcpy_order, nonblock=False
+            sym_K_weight, K_u32, 0, 0, P, P, config.n_kv_heads * dim_p_pe * head_dim_p_pe, streaming=False, data_type=io_dtype, order=memcpy_order, nonblock=False
         )
-        
-        V_reshape = tensor_v_weight_shifted.reshape(P, dim_p_pe, P, dim_p_pe)
-        V_transpose = V_reshape.transpose(0, 2, 1, 3)
-        V_reshape = V_transpose.reshape(P, P, dim_p_pe * dim_p_pe)
-        V_u32 = cast_tensor_u32(V_reshape.ravel())
+
+        V_u32 = cast_tensor_u32(v_hm.ravel())
         runner.memcpy_h2d(
-            sym_V_weight, V_u32, 0, 0, P, P, dim_p_pe * dim_p_pe, streaming=False, data_type=io_dtype, order=memcpy_order, nonblock=False
+            sym_V_weight, V_u32, 0, 0, P, P, config.n_kv_heads * dim_p_pe * head_dim_p_pe, streaming=False, data_type=io_dtype, order=memcpy_order, nonblock=False
         )
         
         freqs_sin_u32 = cast_tensor_u32(tensor_freqs_sin.ravel())
@@ -310,12 +332,10 @@ def main():
             sym_freqs_cos, freqs_cos_u32, 0, 0, P, P, _dim_p_pe//2, streaming=False, data_type=io_dtype, order=memcpy_order, nonblock=False
         )
         
-        O_reshape = tensor_o_weight_shifted.reshape(P, dim_p_pe, P, dim_p_pe)
-        O_transpose = O_reshape.transpose(0, 2, 1, 3)
-        O_reshape = O_transpose.reshape(P, P, dim_p_pe * dim_p_pe)
-        O_u32 = cast_tensor_u32(O_reshape.ravel())
+        # wyn: O weight per-PE head-major [P, P, n_heads*head_dim_p_pe*dim_p_pe]
+        O_u32 = cast_tensor_u32(o_hm.ravel())
         runner.memcpy_h2d(
-            sym_O_weight, O_u32, 0, 0, P, P, dim_p_pe * dim_p_pe, streaming=False, data_type=io_dtype, order=memcpy_order, nonblock=False
+            sym_O_weight, O_u32, 0, 0, P, P, config.n_heads * head_dim_p_pe * dim_p_pe, streaming=False, data_type=io_dtype, order=memcpy_order, nonblock=False
         )
         
         UP_reshape = tensor_up_weight_shifted.reshape(P, dim_p_pe, P, ffn_dim_p_pe)
