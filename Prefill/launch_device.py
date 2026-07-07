@@ -194,13 +194,24 @@ def main():
     half = head_dim_p_pe // 2         # per-head pairs actually used per PE
     tensor_freqs_cos = np.zeros((P, P, npairs), dtype=np.float16)
     tensor_freqs_sin = np.zeros((P, P, npairs), dtype=np.float16)
-    for py in range(P):
-        for px in range(P):
-            for l in range(half):
-                i = px * half + l    # within-head pair index (0..head_dim/2-1)
+    if head_dim_p_pe == 1:
+        # wyn: P > head_dim/2 (e.g. P=128). Each PE holds ONE head-dim (col px), so a rope pair
+        # (dims 2m, 2m+1) straddles cols 2m,2m+1 -> both PEs use pair index i = px//2 and swap the
+        # partner value at runtime (rope_nn / rope_pair_exchange). Store the shared angle at [.,.,0].
+        for py in range(P):
+            for px in range(P):
+                i = px // 2
                 angle = py * (theta ** (-2.0 * i / head_dim))
-                tensor_freqs_cos[py, px, l] = np.cos(angle)
-                tensor_freqs_sin[py, px, l] = np.sin(angle)
+                tensor_freqs_cos[py, px, 0] = np.cos(angle)
+                tensor_freqs_sin[py, px, 0] = np.sin(angle)
+    else:
+        for py in range(P):
+            for px in range(P):
+                for l in range(half):
+                    i = px * half + l    # within-head pair index (0..head_dim/2-1)
+                    angle = py * (theta ** (-2.0 * i / head_dim))
+                    tensor_freqs_cos[py, px, l] = np.cos(angle)
+                    tensor_freqs_sin[py, px, l] = np.sin(angle)
 
     tensor_o_weight = weights["o"]
     tensor_up_weight = weights["up"]
