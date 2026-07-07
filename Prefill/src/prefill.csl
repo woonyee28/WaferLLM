@@ -504,7 +504,7 @@ fn xq_matmul() void {
     ptr_right_matrix_send = &dim_dim_tmp;
     // wyn: project only head_idx's slice of Q -> XQ_h [seq, head_dim]. Q weight is head-major:
     // head h at element offset h * (dim_p_pe * head_dim_p_pe).
-    ptr_right_matrix_recv = &Q_weight_tile[head_idx * dim_p_pe * head_dim_p_pe];
+    ptr_right_matrix_recv = @ptrcast([*]f16, &Q_weight_tile[head_idx * dim_p_pe * head_dim_p_pe]);
 
     ptr_out_matrix = &XQ_tile;
 
@@ -544,7 +544,7 @@ fn xk_matmul() void {
 
     ptr_right_matrix_send = &dim_dim_tmp;
     // wyn: project KV head kv_head_idx's slice of K -> XK_g [seq, head_dim]
-    ptr_right_matrix_recv = &K_weight_tile[kv_head_idx * dim_p_pe * head_dim_p_pe];
+    ptr_right_matrix_recv = @ptrcast([*]f16, &K_weight_tile[kv_head_idx * dim_p_pe * head_dim_p_pe]);
 
     ptr_out_matrix = &XK_tile;
 
@@ -575,7 +575,7 @@ fn xv_matmul() void {
 
     ptr_right_matrix_send = &dim_dim_tmp;
     // wyn: project KV head kv_head_idx's slice of V -> XV_g [seq, head_dim]
-    ptr_right_matrix_recv = &V_weight_tile[kv_head_idx * dim_p_pe * head_dim_p_pe];
+    ptr_right_matrix_recv = @ptrcast([*]f16, &V_weight_tile[kv_head_idx * dim_p_pe * head_dim_p_pe]);
 
     ptr_out_matrix = &XV_tile;
 
@@ -799,7 +799,7 @@ fn h1_matmul() void {
     ptr_left_matrix_recv = &output_tile;
 
     ptr_right_matrix_send = &dim_dim_tmp;
-    ptr_right_matrix_recv = &O_weight_tile[head_idx * head_dim_p_pe * dim_p_pe];
+    ptr_right_matrix_recv = @ptrcast([*]f16, &O_weight_tile[head_idx * head_dim_p_pe * dim_p_pe]);
 
     ptr_out_matrix = &h1_tile;
 
