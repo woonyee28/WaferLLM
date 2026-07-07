@@ -31,7 +31,9 @@ def load_block0_weights(head_dim, n_heads, n_kv_heads):
     import glob, torch
     from safetensors import safe_open
 
-    model_dir = "/home/woonyee/.cache/huggingface/hub/models--meta-llama--Meta-Llama-3-8B"
+    # wyn: derive from the HF cache under ~ (honor HF_HOME); portable across machines
+    hf_home = os.environ.get("HF_HOME", os.path.expanduser("~/.cache/huggingface"))
+    model_dir = os.path.join(hf_home, "hub", "models--meta-llama--Meta-Llama-3-8B")
     prefix = "model.layers.0."
 
     raw = {}
@@ -156,7 +158,9 @@ def main():
     # (baseline.py dump), zero-padded up to seq_len (a multiple of P).
     weights = load_block0_weights(head_dim, config.n_heads, config.n_kv_heads)
 
-    resid_dir = "/home/woonyee/Cerebras/pytorch"
+    # wyn: derive from the repo root (Cerebras/WaferLLM/Prefill/launch_device.py -> Cerebras/pytorch)
+    repo_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    resid_dir = os.path.join(repo_root, "pytorch")
     resid_pre = np.load(os.path.join(resid_dir, "resid_pre_block0.npy")).astype(np.float16)  # [n_tok, dim]
     n_tok = resid_pre.shape[0]
     assert n_tok <= seq_len, f"prompt has {n_tok} tokens > seq_len {seq_len}; raise seq_len in the config"
