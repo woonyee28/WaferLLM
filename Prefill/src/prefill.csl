@@ -25,6 +25,15 @@ const model_dim: f16 = @as(f16, dim_p_pe * P);
 const head_dim: f16 = @as(f16, head_dim_p_pe * P);
 // wyn: end
 
+// wyn: GQA head-sequential loop state. n_heads query heads, group = query heads per KV head.
+// The attention stages (flags for project/rope/score/softmax/output/O-proj) run once per head;
+// head_idx is the current query head, kv_head_idx = head_idx / group is the KV head it attends to.
+const n_heads: i16 = P / pes_p_head;
+const group: i16 = pes_p_kv_head / pes_p_head;   // = n_heads / n_kv_heads
+var head_idx: i16 = 0;
+var kv_head_idx: i16 = 0;
+// wyn: end
+
 var root: i16 = P / 2;
 var reduce_root: i16 = 0;
 const seq_len_p_pe_2: i16 = seq_len_p_pe * 2;
@@ -128,11 +137,14 @@ var ptr_W2: [*]f16 = &W2_tile;
 var Q_weight_tile: [dim_p_pe * dim_p_pe]f16 = @zeros([dim_p_pe * dim_p_pe]f16);
 var ptr_Q_weight: [*]f16 = &Q_weight_tile;
 
-var K_weight_tile: [dim_p_pe * dim_p_pe]f16 = @zeros([dim_p_pe * dim_p_pe]f16);
+// wyn: rectangular K/V weights — hold n_kv_heads head-slices of [dim_p_pe*head_dim_p_pe]
+// (total dim_p_pe*kv_dim_p_pe), vs the full dim_p_pe*dim_p_pe for Q.
+var K_weight_tile: [dim_p_pe * kv_dim_p_pe]f16 = @zeros([dim_p_pe * kv_dim_p_pe]f16);
 var ptr_K_weight: [*]f16 = &K_weight_tile;
 
-var V_weight_tile: [dim_p_pe * dim_p_pe]f16 = @zeros([dim_p_pe * dim_p_pe]f16);
+var V_weight_tile: [dim_p_pe * kv_dim_p_pe]f16 = @zeros([dim_p_pe * kv_dim_p_pe]f16);
 var ptr_V_weight: [*]f16 = &V_weight_tile;
+// wyn: end
 
 var freqs_sin: [_dim_p_pe / 2]f16 = @zeros([_dim_p_pe / 2]f16);
 var ptr_freqs_sin: [*]f16 = &freqs_sin;
@@ -157,18 +169,19 @@ var ptr_DOWN_weight: [*]f16 = &DOWN_weight_tile;
 var X_norm_tile: [seq_len_p_pe * dim_p_pe]f16 = @zeros([seq_len_p_pe * dim_p_pe]f16);
 var ptr_X_norm: [*]f16 = &X_norm_tile;
 
-// * XQ, XK, XV: QKV in prefill
-var XQ_tile: [seq_len_p_pe * dim_p_pe]f16 = @zeros([seq_len_p_pe * dim_p_pe]f16); 
+// * XQ, XK, XV: per-head QKV in prefill. One head fills the mesh: head_dim across all P
+// columns (head_dim_p_pe per PE), so each tile is [seq_len_p_pe * head_dim_p_pe].
+var XQ_tile: [seq_len_p_pe * head_dim_p_pe]f16 = @zeros([seq_len_p_pe * head_dim_p_pe]f16);
 var ptr_XQ: [*]f16 = &XQ_tile;
-var XQ_dsd = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{seq_len_p_pe * dim_p_pe} -> XQ_tile[i] });
+var XQ_dsd = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{seq_len_p_pe * head_dim_p_pe} -> XQ_tile[i] });
 
-var XK_tile: [seq_len_p_pe * dim_p_pe]f16 = @zeros([seq_len_p_pe * dim_p_pe]f16);
+var XK_tile: [seq_len_p_pe * head_dim_p_pe]f16 = @zeros([seq_len_p_pe * head_dim_p_pe]f16);
 var ptr_XK: [*]f16 = &XK_tile;
-var XK_dsd = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{seq_len_p_pe * dim_p_pe} -> XK_tile[i] });
+var XK_dsd = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{seq_len_p_pe * head_dim_p_pe} -> XK_tile[i] });
 
-var XV_tile: [seq_len_p_pe * dim_p_pe]f16 = @zeros([seq_len_p_pe * dim_p_pe]f16);
+var XV_tile: [seq_len_p_pe * head_dim_p_pe]f16 = @zeros([seq_len_p_pe * head_dim_p_pe]f16);
 var ptr_XV: [*]f16 = &XV_tile;
-var XV_dsd = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{seq_len_p_pe * dim_p_pe} -> XV_tile[i] });
+var XV_dsd = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{seq_len_p_pe * head_dim_p_pe} -> XV_tile[i] });
 
 var local_sum: [seq_len_p_pe]f16 = @zeros([seq_len_p_pe]f16);
 var ptr_local_sum: [*]f16 = &local_sum;
@@ -180,9 +193,11 @@ var local_max: [seq_len_p_pe]f16 = @zeros([seq_len_p_pe]f16);
 var ptr_local_max: [*]f16 = &local_max;
 var local_max_dsd = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{seq_len_p_pe} -> local_max[i] });
 
-var output_tile: [seq_len_p_pe * dim_p_pe]f16 = @zeros([seq_len_p_pe * dim_p_pe]f16);
+// wyn: per-head attention output [seq_len_p_pe * head_dim_p_pe]; each head's result is fed
+// through its O-weight slice and accumulated into h1 (see o-projection), so no [seq,dim] concat.
+var output_tile: [seq_len_p_pe * head_dim_p_pe]f16 = @zeros([seq_len_p_pe * head_dim_p_pe]f16);
 var ptr_output: [*]f16 = &output_tile;
-var output_dsd = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{seq_len_p_pe * dim_p_pe} -> output_tile[i] });
+var output_dsd = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{seq_len_p_pe * head_dim_p_pe} -> output_tile[i] });
 
 var X_tmp_1: [_dim_p_pe / 2]f16 = @zeros([_dim_p_pe / 2]f16);
 var ptr_X_tmp_1: [*]f16 = &X_tmp_1;
@@ -487,13 +502,15 @@ fn xq_matmul() void {
     ptr_left_matrix_recv = &X_norm_tile;
 
     ptr_right_matrix_send = &dim_dim_tmp;
-    ptr_right_matrix_recv = &Q_weight_tile;
+    // wyn: project only head_idx's slice of Q -> XQ_h [seq, head_dim]. Q weight is head-major:
+    // head h at element offset h * (dim_p_pe * head_dim_p_pe).
+    ptr_right_matrix_recv = &Q_weight_tile[head_idx * dim_p_pe * head_dim_p_pe];
 
     ptr_out_matrix = &XQ_tile;
 
     Mt = seq_len_p_pe;
     Kt = dim_p_pe;
-    Nt = dim_p_pe;
+    Nt = head_dim_p_pe;
 
     left_matrix_dsd = @set_dsd_length(left_matrix_dsd, @bitcast(u16, Mt));
     right_matrix_dsd = @set_dsd_length(right_matrix_dsd, @bitcast(u16, Nt));
@@ -504,10 +521,16 @@ fn xq_matmul() void {
 
     left_dim_length = Mt * Kt;
 
-    in_preshift = true;
-    pre_remaining = offset_step;
-    shift_round = 0;
-    left_matrix_shift_callback();
+    // wyn: pre-shift X_norm only for head 0. Each head's 3 projections (P steps each) restore
+    // X_norm to the pre-shifted position, so later heads reuse it without re-shifting.
+    if (head_idx == 0) {
+        in_preshift = true;
+        pre_remaining = offset_step;
+        shift_round = 0;
+        left_matrix_shift_callback();
+    } else {
+        matmul_compute();
+    }
 }
 
 fn xk_matmul() void {
@@ -520,13 +543,14 @@ fn xk_matmul() void {
     ptr_left_matrix_recv = &X_norm_tile;
 
     ptr_right_matrix_send = &dim_dim_tmp;
-    ptr_right_matrix_recv = &K_weight_tile;
+    // wyn: project KV head kv_head_idx's slice of K -> XK_g [seq, head_dim]
+    ptr_right_matrix_recv = &K_weight_tile[kv_head_idx * dim_p_pe * head_dim_p_pe];
 
     ptr_out_matrix = &XK_tile;
 
     Mt = seq_len_p_pe;
     Kt = dim_p_pe;
-    Nt = dim_p_pe;
+    Nt = head_dim_p_pe;
 
     left_matrix_dsd = @set_dsd_length(left_matrix_dsd, @bitcast(u16, Mt));
     right_matrix_dsd = @set_dsd_length(right_matrix_dsd, @bitcast(u16, Nt));
@@ -550,13 +574,14 @@ fn xv_matmul() void {
     ptr_left_matrix_recv = &X_norm_tile;
 
     ptr_right_matrix_send = &dim_dim_tmp;
-    ptr_right_matrix_recv = &V_weight_tile;
+    // wyn: project KV head kv_head_idx's slice of V -> XV_g [seq, head_dim]
+    ptr_right_matrix_recv = &V_weight_tile[kv_head_idx * dim_p_pe * head_dim_p_pe];
 
     ptr_out_matrix = &XV_tile;
 
     Mt = seq_len_p_pe;
     Kt = dim_p_pe;
-    Nt = dim_p_pe;
+    Nt = head_dim_p_pe;
 
     left_matrix_dsd = @set_dsd_length(left_matrix_dsd, @bitcast(u16, Mt));
     right_matrix_dsd = @set_dsd_length(right_matrix_dsd, @bitcast(u16, Nt));
@@ -577,7 +602,8 @@ fn xq_rope() void {
     seqLen_dsd_2 = @set_dsd_base_addr(seqLen_dsd_2, ptr_XQ);
     seqLen_dsd_2 = @increment_dsd_offset(seqLen_dsd_2, seq_len_p_pe, f16);
 
-    for (@range(i16, _dim_p_pe/2)) |i| {
+    // wyn: rope rotates this PE's head_dim_p_pe columns -> head_dim_p_pe/2 adjacent pairs
+    for (@range(i16, head_dim_p_pe/2)) |i| {
         cos_val = freqs_cos[i];
         sin_val = freqs_sin[i];
 
@@ -605,7 +631,8 @@ fn xk_rope() void {
     seqLen_dsd_2 = @set_dsd_base_addr(seqLen_dsd_2, ptr_XK);
     seqLen_dsd_2 = @increment_dsd_offset(seqLen_dsd_2, seq_len_p_pe, f16);
 
-    for (@range(i16, _dim_p_pe/2)) |i| {
+    // wyn: rope rotates this PE's head_dim_p_pe columns -> head_dim_p_pe/2 adjacent pairs
+    for (@range(i16, head_dim_p_pe/2)) |i| {
         cos_val = freqs_cos[i];
         sin_val = freqs_sin[i];
 
@@ -640,7 +667,7 @@ fn score_matmul() void {
     ptr_out_matrix = &seqLen_seqLen_tmp;
 
     Mt = seq_len_p_pe;
-    Kt = dim_p_pe;
+    Kt = head_dim_p_pe;  // wyn: per-head score contracts head_dim (full-row reduce: head_dim_p_pe*P)
     Nt = seq_len_p_pe;
 
     left_matrix_dsd = @set_dsd_length(left_matrix_dsd, @bitcast(u16, Mt));
@@ -741,7 +768,7 @@ fn output_matmul() void {
 
     Mt = seq_len_p_pe;
     Kt = seq_len_p_pe;
-    Nt = dim_p_pe;
+    Nt = head_dim_p_pe;  // wyn: output_h is [seq, head_dim]
 
     left_matrix_dsd = @set_dsd_length(left_matrix_dsd, @bitcast(u16, Mt));
     right_matrix_dsd = @set_dsd_length(right_matrix_dsd, @bitcast(u16, Nt));
@@ -760,20 +787,24 @@ fn output_matmul() void {
 
 fn h1_matmul() void {
 
-    // Clearing
-    @load_to_dsr(comp_dest_dsr_1, h1_dsd);
-    @fmovh(comp_dest_dsr_1, 0.0);
+    // wyn: per-head O-projection with ACCUMULATION. h1 += output_h @ Wo_h, where Wo_h is head
+    // head_idx's [head_dim, dim] slice of O (head-major, offset head_idx*head_dim_p_pe*dim_p_pe).
+    // Clear h1 only once (head 0); later heads accumulate on top via the matmul's fmach.
+    if (head_idx == 0) {
+        @load_to_dsr(comp_dest_dsr_1, h1_dsd);
+        @fmovh(comp_dest_dsr_1, 0.0);
+    }
 
     ptr_left_matrix_send = &seqLen_dim_tmp;
     ptr_left_matrix_recv = &output_tile;
 
     ptr_right_matrix_send = &dim_dim_tmp;
-    ptr_right_matrix_recv = &O_weight_tile;
+    ptr_right_matrix_recv = &O_weight_tile[head_idx * head_dim_p_pe * dim_p_pe];
 
     ptr_out_matrix = &h1_tile;
 
     Mt = seq_len_p_pe;
-    Kt = dim_p_pe;
+    Kt = head_dim_p_pe;  // wyn: contract head_dim (output_h is [seq, head_dim])
     Nt = dim_p_pe;
 
     left_matrix_dsd = @set_dsd_length(left_matrix_dsd, @bitcast(u16, Mt));
@@ -1013,8 +1044,20 @@ fn prefill_struct() void {
         flag += 1;
         h1_matmul();
     } else if (flag == 10) {
-        flag += 1;
-        z_add();
+        // wyn: head-sequential loop. After head_idx's O-proj accumulate into h1, either start
+        // the next head's attention, or (all heads done) proceed to the FFN. rmsnorm_x (flag 0)
+        // ran once and X_norm is shared across heads.
+        if (head_idx < n_heads - 1) {
+            head_idx += 1;
+            kv_head_idx = head_idx / group;
+            flag = 2;          // re-enter at xq (mirrors the flag==1 handler: flag=2 while xq runs)
+            xq_matmul();
+        } else {
+            head_idx = 0;      // reset for the next repeat / layer
+            kv_head_idx = 0;
+            flag += 1;         // -> 11
+            z_add();
+        }
     } else if (flag == 11) {
         flag += 1;
         rmsnorm_z();

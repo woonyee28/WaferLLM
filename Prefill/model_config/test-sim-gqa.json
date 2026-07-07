@@ -1,9 +1,9 @@
 {
-    "P": 8,
+    "P": 4,
     "dim": 32,
     "n_heads": 4,
     "n_kv_heads": 2,
     "head_dim": 8,
-    "seq_len": 64,
+    "seq_len": 8,
     "ffn_dim": 32
 }
