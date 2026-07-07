@@ -188,6 +188,10 @@ var XV_tile: [seq_len_p_pe * head_dim_p_pe]f16 = @zeros([seq_len_p_pe * head_dim
 var ptr_XV: [*]f16 = &XV_tile;
 var XV_dsd = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{seq_len_p_pe * head_dim_p_pe} -> XV_tile[i] });
 
+// wyn: rope pair partner received from the horizontal neighbor (head_dim_p_pe==1 path only)
+var rope_partner: [seq_len_p_pe]f16 = @zeros([seq_len_p_pe]f16);
+var ptr_rope_partner: [*]f16 = &rope_partner;
+
 var local_sum: [seq_len_p_pe]f16 = @zeros([seq_len_p_pe]f16);
 var ptr_local_sum: [*]f16 = &local_sum;
 var local_sum_dsd = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{seq_len_p_pe} -> local_sum[i] });
@@ -606,7 +610,33 @@ fn xv_matmul() void {
     matmul_compute(); // X_norm has been already shifted in xq_matmul
 }
 
+// wyn: head_dim_p_pe==1 rope — the pair's other dim lives on the neighbor column-PE, so swap
+// values over the reduce fabric then apply the SAME reflection the local loop does:
+//   even col holds pair-lo a: a' = partner(b)*cos - a*sin
+//   odd  col holds pair-hi b: b' = partner(a)*cos + b*sin
+// Both PEs of a pair share one angle -> freqs_*[0] (seq_len_p_pe==1 whenever rope runs).
+fn rope_nn(x_ptr: [*]f16) void {
+    comm_mod.rope_pair_exchange(x_ptr, ptr_rope_partner);
+    var c: f16 = freqs_cos[0];
+    var s: f16 = freqs_sin[0];
+    if (px % 2 == 0) {
+        for (@range(i16, seq_len_p_pe)) |j| {
+            x_ptr[j] = rope_partner[j] * c - x_ptr[j] * s;
+        }
+    } else {
+        for (@range(i16, seq_len_p_pe)) |j| {
+            x_ptr[j] = rope_partner[j] * c + x_ptr[j] * s;
+        }
+    }
+}
+
 fn xq_rope() void {
+
+    if (head_dim_p_pe == 1) {
+        rope_nn(ptr_XQ);
+        prefill_struct();
+        return;
+    }
 
     seqLen_dsd_1 = @set_dsd_base_addr(seqLen_dsd_1, ptr_XQ);
 
@@ -631,11 +661,17 @@ fn xq_rope() void {
         @fsubh(seqLen_dsd_1, X_tmp_1_dsd, X_tmp_2_dsd);
         @faddh(seqLen_dsd_2, X_tmp_3_dsd, X_tmp_4_dsd);
     }
-    
+
     prefill_struct();
 }
 
 fn xk_rope() void {
+
+    if (head_dim_p_pe == 1) {
+        rope_nn(ptr_XK);
+        prefill_struct();
+        return;
+    }
 
     seqLen_dsd_1 = @set_dsd_base_addr(seqLen_dsd_1, ptr_XK);
 
@@ -660,7 +696,7 @@ fn xk_rope() void {
         @fsubh(seqLen_dsd_1, X_tmp_1_dsd, X_tmp_2_dsd);
         @faddh(seqLen_dsd_2, X_tmp_3_dsd, X_tmp_4_dsd);
     }
-    
+
     prefill_struct();
 }
 

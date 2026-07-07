@@ -238,6 +238,33 @@ fn mv_allreduce_add_x(vector_buf_ptr: [*]f16) void {
     }
 }
 
+// ===================== RoPE nearest-neighbor pair exchange ================= //
+// Used only when head_dim_p_pe==1 (P > head_dim/2, e.g. P=128): a rope pair
+// (head dims 2m, 2m+1) then straddles adjacent column-PEs, so each PE swaps its
+// single value with its horizontal partner. Reuses the idle reduce colors — the
+// interleave already lines up (even c_right_send == odd c_right_recv, even
+// c_left_recv == odd c_left_send), so no new colors/routing are needed:
+//   even col (pair-lo): send EAST on mv_right_send, recv from EAST on mv_left_recv
+//   odd  col (pair-hi): send WEST on mv_left_send,  recv from WEST on mv_right_recv
+// Extent = seq_len_p_pe (== 1 whenever rope runs).
+
+var rope_send_dsd = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{seq_len_p_pe} -> dummy[i] });
+var rope_recv_dsd = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{seq_len_p_pe} -> dummy[i] });
+
+fn rope_pair_exchange(val_ptr: [*]f16, recv_ptr: [*]f16) void {
+    rope_send_dsd = @set_dsd_base_addr(rope_send_dsd, val_ptr);
+    rope_recv_dsd = @set_dsd_base_addr(rope_recv_dsd, recv_ptr);
+    @load_to_dsr(vector_buf_dsr, rope_send_dsd);
+
+    if (px % 2 == 0) {
+        @fmovh(mv_right_send, vector_buf_dsr);   // send pair-lo EAST to odd partner
+        @mov16(rope_recv_dsd, mv_left_recv);     // recv pair-hi from EAST
+    } else {
+        @fmovh(mv_left_send, vector_buf_dsr);    // send pair-hi WEST to even partner
+        @mov16(rope_recv_dsd, mv_right_recv);    // recv pair-lo from WEST
+    }
+}
+
 // ================= matmul_T reduce (seqLen x seqLen tiles) ================== //
 
 const mv_right_send_seqLen_seqLen = @get_dsd(fabout_dsd, .{
