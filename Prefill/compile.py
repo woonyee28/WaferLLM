@@ -20,6 +20,8 @@ def derive_params(cj):
         "pes_p_head": P // cj["n_heads"],
         "pes_p_kv_head": P // cj["n_kv_heads"],
         "head_dim_p_pe": cj["head_dim"] // P,
+        # wyn: KV projection width per PE = (n_kv_heads * head_dim) / P (GQA K/V are narrower than dim)
+        "kv_dim_p_pe": (cj["n_kv_heads"] * cj["head_dim"]) // P,
         "seq_len_p_pe": cj["seq_len"] // P,
         "ffn_dim_p_pe": cj["ffn_dim"] // P,
     }

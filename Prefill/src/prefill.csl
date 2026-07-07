@@ -9,6 +9,7 @@ param ffn_dim_p_pe: i16;
 param pes_p_head: i16;
 param pes_p_kv_head: i16;
 param head_dim_p_pe: i16;
+param kv_dim_p_pe: i16;
 // wyn: end
 
 const eps: f16 = 0.000001;
