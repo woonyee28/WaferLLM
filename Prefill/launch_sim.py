@@ -94,7 +94,10 @@ def main():
     dim_p_pe = dim // P
     seq_len_p_pe = seq_len // P
     ffn_dim_p_pe = ffn_dim // P
-    
+    # wyn: GQA K/V projection width (n_kv_heads * head_dim), narrower than dim
+    kv_dim = config.n_kv_heads * config.head_dim
+    kv_dim_p_pe = kv_dim // P
+
     _dim_p_pe = dim_p_pe
     if (dim_p_pe % 2) == 1:
         _dim_p_pe = dim_p_pe - 1
@@ -113,8 +116,9 @@ def main():
     # wyn: end
 
     tensor_q_weight = np.random.rand(dim, dim).astype(np.float16)
-    tensor_k_weight = np.random.rand(dim, dim).astype(np.float16)
-    tensor_v_weight = np.random.rand(dim, dim).astype(np.float16)
+    # wyn: rectangular K/V (dim, kv_dim). Mechanical only — layout need not be head-major for sim.
+    tensor_k_weight = np.random.rand(dim, kv_dim).astype(np.float16)
+    tensor_v_weight = np.random.rand(dim, kv_dim).astype(np.float16)
 
     freqs_sin = np.random.rand(1, P*_dim_p_pe//2).astype(np.float16)
     tensor_freqs_sin = np.tile(freqs_sin.reshape(P, _dim_p_pe//2), reps=(1, P))
@@ -141,8 +145,8 @@ def main():
                     ind[i, j], _ = assignId(ind[i-2, j], P)
                     
     tensor_q_weight_shifted = np.zeros((dim, dim)).astype(np.float16)
-    tensor_k_weight_shifted = np.zeros((dim, dim)).astype(np.float16)
-    tensor_v_weight_shifted = np.zeros((dim, dim)).astype(np.float16)
+    tensor_k_weight_shifted = np.zeros((dim, kv_dim)).astype(np.float16)
+    tensor_v_weight_shifted = np.zeros((dim, kv_dim)).astype(np.float16)
     
     tensor_o_weight_shifted = np.zeros((dim, dim)).astype(np.float16)
     tensor_up_weight_shifted = np.zeros((dim, ffn_dim)).astype(np.float16)
@@ -153,8 +157,8 @@ def main():
         for j in range(P):
             t = ind[i, j]
             tensor_q_weight_shifted[i*dim_p_pe:(i+1)*dim_p_pe, j*dim_p_pe:(j+1)*dim_p_pe] = tensor_q_weight[t*dim_p_pe:(t+1)*dim_p_pe, j*dim_p_pe:(j+1)*dim_p_pe]
-            tensor_k_weight_shifted[i*dim_p_pe:(i+1)*dim_p_pe, j*dim_p_pe:(j+1)*dim_p_pe] = tensor_k_weight[t*dim_p_pe:(t+1)*dim_p_pe, j*dim_p_pe:(j+1)*dim_p_pe]
-            tensor_v_weight_shifted[i*dim_p_pe:(i+1)*dim_p_pe, j*dim_p_pe:(j+1)*dim_p_pe] = tensor_v_weight[t*dim_p_pe:(t+1)*dim_p_pe, j*dim_p_pe:(j+1)*dim_p_pe]
+            tensor_k_weight_shifted[i*dim_p_pe:(i+1)*dim_p_pe, j*kv_dim_p_pe:(j+1)*kv_dim_p_pe] = tensor_k_weight[t*dim_p_pe:(t+1)*dim_p_pe, j*kv_dim_p_pe:(j+1)*kv_dim_p_pe]
+            tensor_v_weight_shifted[i*dim_p_pe:(i+1)*dim_p_pe, j*kv_dim_p_pe:(j+1)*kv_dim_p_pe] = tensor_v_weight[t*dim_p_pe:(t+1)*dim_p_pe, j*kv_dim_p_pe:(j+1)*kv_dim_p_pe]
             
             tensor_o_weight_shifted[i*dim_p_pe:(i+1)*dim_p_pe, j*dim_p_pe:(j+1)*dim_p_pe] = tensor_o_weight[t*dim_p_pe:(t+1)*dim_p_pe, j*dim_p_pe:(j+1)*dim_p_pe]
             tensor_up_weight_shifted[i*dim_p_pe:(i+1)*dim_p_pe, j*ffn_dim_p_pe:(j+1)*ffn_dim_p_pe] = tensor_up_weight[t*dim_p_pe:(t+1)*dim_p_pe, j*ffn_dim_p_pe:(j+1)*ffn_dim_p_pe]
@@ -218,20 +222,21 @@ def main():
         sym_Q_weight, Q_u32, 0, 0, P, P, dim_p_pe * dim_p_pe, streaming=False, data_type=io_dtype, order=memcpy_order, nonblock=False
     )
     
-    K_reshape = tensor_k_weight_shifted.reshape(P, dim_p_pe, P, dim_p_pe)
+    # wyn: rectangular K/V — output width is kv_dim_p_pe per PE, not dim_p_pe
+    K_reshape = tensor_k_weight_shifted.reshape(P, dim_p_pe, P, kv_dim_p_pe)
     K_transpose = K_reshape.transpose(0, 2, 1, 3)
-    K_reshape = K_transpose.reshape(P, P, dim_p_pe * dim_p_pe)
+    K_reshape = K_transpose.reshape(P, P, dim_p_pe * kv_dim_p_pe)
     K_u32 = input_array_to_u32(K_reshape.ravel(), 1, 1)
     runner.memcpy_h2d(
-        sym_K_weight, K_u32, 0, 0, P, P, dim_p_pe * dim_p_pe, streaming=False, data_type=io_dtype, order=memcpy_order, nonblock=False
+        sym_K_weight, K_u32, 0, 0, P, P, dim_p_pe * kv_dim_p_pe, streaming=False, data_type=io_dtype, order=memcpy_order, nonblock=False
     )
-    
-    V_reshape = tensor_v_weight_shifted.reshape(P, dim_p_pe, P, dim_p_pe)
+
+    V_reshape = tensor_v_weight_shifted.reshape(P, dim_p_pe, P, kv_dim_p_pe)
     V_transpose = V_reshape.transpose(0, 2, 1, 3)
-    V_reshape = V_transpose.reshape(P, P, dim_p_pe * dim_p_pe)
+    V_reshape = V_transpose.reshape(P, P, dim_p_pe * kv_dim_p_pe)
     V_u32 = input_array_to_u32(V_reshape.ravel(), 1, 1)
     runner.memcpy_h2d(
-        sym_V_weight, V_u32, 0, 0, P, P, dim_p_pe * dim_p_pe, streaming=False, data_type=io_dtype, order=memcpy_order, nonblock=False
+        sym_V_weight, V_u32, 0, 0, P, P, dim_p_pe * kv_dim_p_pe, streaming=False, data_type=io_dtype, order=memcpy_order, nonblock=False
     )
     
     freqs_sin_u32 = input_array_to_u32(tensor_freqs_sin.ravel(), 1, 1)
