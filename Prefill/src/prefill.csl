@@ -49,6 +49,7 @@ const layout_mod = @import_module("<layout>");
 const comm_mod = @import_module("comm_lib/comm_pe.csl", .{
     .comm_params = comm_params,
     .P = P, .dim_p_pe = dim_p_pe, .seq_len_p_pe = seq_len_p_pe, .ffn_dim_p_pe = ffn_dim_p_pe,
+    .head_dim_p_pe = head_dim_p_pe,  // wyn: per-head GQA tile size
     .left_matrix_finish_id = left_matrix_finish_id,
     .right_matrix_finish_id = right_matrix_finish_id,
 });
