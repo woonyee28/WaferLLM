@@ -521,16 +521,12 @@ fn xq_matmul() void {
 
     left_dim_length = Mt * Kt;
 
-    // wyn: pre-shift X_norm only for head 0. Each head's 3 projections (P steps each) restore
-    // X_norm to the pre-shifted position, so later heads reuse it without re-shifting.
-    if (head_idx == 0) {
-        in_preshift = true;
-        pre_remaining = offset_step;
-        shift_round = 0;
-        left_matrix_shift_callback();
-    } else {
-        matmul_compute();
-    }
+    // wyn: pre-shift X_norm every head (mirrors the single-head structure so each head re-primes
+    // the X comm channel — skipping it on later heads deadlocked the matmul chain).
+    in_preshift = true;
+    pre_remaining = offset_step;
+    shift_round = 0;
+    left_matrix_shift_callback();
 }
 
 fn xk_matmul() void {
