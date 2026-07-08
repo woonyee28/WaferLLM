@@ -943,8 +943,12 @@ fn rmsnorm_z() void {
     @load_to_dsr(comp_dest_dsr_1, seqLen_dsd_1, .{ .save_address = true });
     @load_to_dsr(comp_src0_dsr_1, seqLen_dsd_2, .{ .save_address = true });
 
+    // wyn: local_sum has only seq_len_p_pe entries; the old local_sum[i] over dim_p_pe read OOB
+    // garbage (masked in the attention compile). seq_len_p_pe==1 here, so every dim shares one
+    // norm factor — read it once and apply to all dims.
+    var nf: f16 = ptr_local_sum[0];
     for (@range(i16, dim_p_pe)) |i| {
-        @fmulh(comp_dest_dsr_1, comp_src0_dsr_1, local_sum[i]);
+        @fmulh(comp_dest_dsr_1, comp_src0_dsr_1, nf);
     }
 
     prefill_struct();
@@ -1256,10 +1260,6 @@ comptime {
     // wyn: export Z
     @export_symbol(ptr_Z, "Z");   // layer output after all processing
     @export_symbol(ptr_Z_mid, "Z_mid");   // wyn: post-attention residual (resid_mid)
-    // wyn: DEBUG — localize ffn_only NaN (rmsnorm output vs first FFN matmul)
-    @export_symbol(ptr_Z_norm, "Z_norm");
-    @export_symbol(ptr_z1, "z1");
-    // wyn: end
     // wyn: end
     @export_symbol(init_task);
     @export_symbol(prefill_host);

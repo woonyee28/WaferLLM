@@ -275,9 +275,6 @@ layout {
     @export_name("Z", [*]f16, true);
     // wyn: post-attention residual (resid_mid), for attention-only validation
     @export_name("Z_mid", [*]f16, true);
-    // wyn: DEBUG — localize ffn_only NaN
-    @export_name("Z_norm", [*]f16, true);
-    @export_name("z1", [*]f16, true);
     // wyn: end
 
     @export_name("init_task", fn()void);

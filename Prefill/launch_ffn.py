@@ -208,18 +208,6 @@ def main():
         Z_1d = sdk_utils.memcpy_view(Z_1d_u32, np.dtype(np.float16))
         Z_layer0 = untile_flat_1d(Z_1d, P, seq_len_p_pe, dim_p_pe)
 
-        # wyn: DEBUG — localize ffn_only NaN (rmsnorm output vs first FFN matmul)
-        def _read(sym_name, per_pe):
-            buf = np.zeros(P * P * per_pe, dtype=np.uint32)
-            runner.memcpy_d2h(buf, runner.get_id(sym_name), 0, 0, P, P, per_pe,
-                              streaming=False, order=memcpy_order, data_type=io_dtype, nonblock=False)
-            return sdk_utils.memcpy_view(buf, np.dtype(np.float16))
-        znorm = _read("Z_norm", seq_len_p_pe * dim_p_pe)
-        z1dbg = _read("z1", seq_len_p_pe * ffn_dim_p_pe)
-        print(f"[DEBUG] Z_norm: nan={bool(np.isnan(znorm).any())} absmax={float(np.nanmax(np.abs(znorm))) if np.isfinite(znorm).any() else 'NA'}")
-        print(f"[DEBUG] z1:     nan={bool(np.isnan(z1dbg).any())} absmax={float(np.nanmax(np.abs(z1dbg))) if np.isfinite(z1dbg).any() else 'NA'}")
-        # wyn: end
-
     # wyn: diff FFN output against block-0 resid_post (real token rows only)
     resid_post = np.load(os.path.join(resid_dir, "resid_post_block0.npy")).astype(np.float32)
     got = Z_layer0[:resid_post.shape[0]].astype(np.float32)
