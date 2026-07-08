@@ -10,6 +10,8 @@ param pes_p_head: i16;
 param pes_p_kv_head: i16;
 param head_dim_p_pe: i16;
 param kv_dim_p_pe: i16;
+// wyn: FFN-only program (disaggregated layer): 1 => skip attention, input X is resid_mid.
+param ffn_only: i16;
 // wyn: end
 
 const eps: f16 = 0.000001;
@@ -1070,8 +1072,17 @@ fn add_result() void {
 var flag: i16 = 0;
 fn prefill_struct() void {
     if (flag == 0) {
-        flag += 1;
-        rmsnorm_x();
+        if (ffn_only == 1) {
+            // wyn: FFN-only (P=256). Input X is resid_mid; copy it into Z and jump straight to
+            // the post-attention norm + FFN, skipping attention (flags 1-10). flag=12 mirrors the
+            // flag==11 handler (flag+=1 then rmsnorm_z), so the FFN stages run unchanged.
+            @fmovh(Z_dsd, X_dsd);
+            flag = 12;
+            rmsnorm_z();
+        } else {
+            flag += 1;
+            rmsnorm_x();
+        }
     } else if (flag == 1) {
         flag += 1;
         xq_matmul();

@@ -24,6 +24,8 @@ def derive_params(cj):
         "kv_dim_p_pe": (cj["n_kv_heads"] * cj["head_dim"]) // P,
         "seq_len_p_pe": cj["seq_len"] // P,
         "ffn_dim_p_pe": cj["ffn_dim"] // P,
+        # wyn: 1 => FFN-only program (skip attention); default 0 for attention/full builds
+        "ffn_only": cj.get("ffn_only", 0),
     }
 
 
