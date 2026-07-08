@@ -907,8 +907,10 @@ fn rmsnorm_z() void {
     seqLen_dsd_1 = @set_dsd_base_addr(seqLen_dsd_1, ptr_seqLen_dim_tmp);
 
     @load_to_dsr(comp_src0_dsr_2, local_sum_dsd, .{ .save_address = false });
-    @load_to_dsr(comp_src1_dsr_2, seqLen_dsd_2, .{ .save_address = true });
-    
+    // wyn: was seqLen_dsd_2 (stale base -> garbage sum -> sqrt(neg)=NaN in ffn_only). Use
+    // seqLen_dsd_1, which is freshly set to seqLen_dim_tmp above (mirrors rmsnorm_x).
+    @load_to_dsr(comp_src1_dsr_2, seqLen_dsd_1, .{ .save_address = true });
+
     for (@range(i16, dim_p_pe)) |i| {
         @faddh(comp_dest_dsr_2, comp_src0_dsr_2, comp_src1_dsr_2);
     }
@@ -1254,6 +1256,10 @@ comptime {
     // wyn: export Z
     @export_symbol(ptr_Z, "Z");   // layer output after all processing
     @export_symbol(ptr_Z_mid, "Z_mid");   // wyn: post-attention residual (resid_mid)
+    // wyn: DEBUG — localize ffn_only NaN (rmsnorm output vs first FFN matmul)
+    @export_symbol(ptr_Z_norm, "Z_norm");
+    @export_symbol(ptr_z1, "z1");
+    // wyn: end
     // wyn: end
     @export_symbol(init_task);
     @export_symbol(prefill_host);
