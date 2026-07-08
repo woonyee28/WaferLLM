@@ -504,8 +504,11 @@ fn rmsnorm_x() void {
     @load_to_dsr(comp_dest_dsr_1, seqLen_dsd_1, .{ .save_address = true });
     @load_to_dsr(comp_src0_dsr_1, seqLen_dsd_2, .{ .save_address = true });
 
+    // wyn: local_sum has only seq_len_p_pe entries; local_sum[i] over dim_p_pe read OOB (worked by
+    // luck in the attention compile). seq_len_p_pe==1, so all dims share one norm factor — read once.
+    var nf: f16 = ptr_local_sum[0];
     for (@range(i16, dim_p_pe)) |i| {
-        @fmulh(comp_dest_dsr_1, comp_src0_dsr_1, local_sum[i]);
+        @fmulh(comp_dest_dsr_1, comp_src0_dsr_1, nf);
     }
 
     // wyn: stash pristine X_norm for the per-head loop to restore before each head's pre-shift
