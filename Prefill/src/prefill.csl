@@ -14,7 +14,9 @@ param kv_dim_p_pe: i16;
 param ffn_only: i16;
 // wyn: end
 
-const eps: f16 = 0.000001;
+// wyn: Llama-3 rms_norm_eps = 1e-5 (was 1e-6). Matters at the BOS token, whose RMSNorm variance
+// is ~1e-5 — comparable to eps — so a wrong eps skews its norm factor ~15-30% (massive-activation dims).
+const eps: f16 = 0.00001;
 // wyn: causal-mask fill value (in fp16, exp(−10000) underflows to exactly 0)
 const neg_inf: f16 = -1.0e4;
 // wyn: end
