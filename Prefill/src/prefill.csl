@@ -177,12 +177,21 @@ var ptr_X_norm: [*]f16 = &X_norm_tile;
 // wyn: pristine copy of X_norm. Each head's projection pre-shifts X_norm in place, so we restore
 // this backup before every head — all heads then project the SAME input through their own weights.
 var X_norm_backup: [seq_len_p_pe * dim_p_pe]f16 = @zeros([seq_len_p_pe * dim_p_pe]f16);
+var ptr_X_norm_backup: [*]f16 = &X_norm_backup;   // wyn: DEBUG export (pristine rmsnorm_x output)
 
 // * XQ, XK, XV: per-head QKV in prefill. One head fills the mesh: head_dim across all P
 // columns (head_dim_p_pe per PE), so each tile is [seq_len_p_pe * head_dim_p_pe].
 var XQ_tile: [seq_len_p_pe * head_dim_p_pe]f16 = @zeros([seq_len_p_pe * head_dim_p_pe]f16);
 var ptr_XQ: [*]f16 = &XQ_tile;
 var XQ_dsd = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{seq_len_p_pe * head_dim_p_pe} -> XQ_tile[i] });
+
+// wyn: DEBUG — head-0 XQ snapshots (pre-rope = projection, post-rope = rope-NN output)
+var xq_proj_dbg: [seq_len_p_pe * head_dim_p_pe]f16 = @zeros([seq_len_p_pe * head_dim_p_pe]f16);
+var ptr_xq_proj_dbg: [*]f16 = &xq_proj_dbg;
+var xq_proj_dbg_dsd = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{seq_len_p_pe * head_dim_p_pe} -> xq_proj_dbg[i] });
+var xq_rope_dbg: [seq_len_p_pe * head_dim_p_pe]f16 = @zeros([seq_len_p_pe * head_dim_p_pe]f16);
+var ptr_xq_rope_dbg: [*]f16 = &xq_rope_dbg;
+var xq_rope_dbg_dsd = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{seq_len_p_pe * head_dim_p_pe} -> xq_rope_dbg[i] });
 
 var XK_tile: [seq_len_p_pe * head_dim_p_pe]f16 = @zeros([seq_len_p_pe * head_dim_p_pe]f16);
 var ptr_XK: [*]f16 = &XK_tile;
@@ -231,6 +240,11 @@ var X_tmp_4_dsd = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{_dim_p_pe / 2} -> 
 var score: [seq_len_p_pe * seq_len_p_pe]f16 = @zeros([seq_len_p_pe * seq_len_p_pe]f16);
 var ptr_score: [*]f16 = &score;
 var score_dsd = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{seq_len_p_pe * seq_len_p_pe} -> score[i] });
+
+// wyn: DEBUG — head-0 raw score (Q.K^T, pre-softmax) snapshot for attention validation
+var score_dbg: [seq_len_p_pe * seq_len_p_pe]f16 = @zeros([seq_len_p_pe * seq_len_p_pe]f16);
+var ptr_score_dbg: [*]f16 = &score_dbg;
+var score_dbg_dsd = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{seq_len_p_pe * seq_len_p_pe} -> score_dbg[i] });
 
 var h1_tile: [seq_len_p_pe * dim_p_pe]f16 = @zeros([seq_len_p_pe * dim_p_pe]f16);
 var ptr_h1: [*]f16 = &h1_tile;
@@ -646,7 +660,9 @@ fn rope_nn(x_ptr: [*]f16) void {
 fn xq_rope() void {
 
     if (head_dim_p_pe == 1) {
+        if (head_idx == 0) { @fmovh(xq_proj_dbg_dsd, XQ_dsd); }   // wyn: DEBUG pre-rope
         rope_nn(ptr_XQ);
+        if (head_idx == 0) { @fmovh(xq_rope_dbg_dsd, XQ_dsd); }   // wyn: DEBUG post-rope
         prefill_struct();
         return;
     }
@@ -741,6 +757,11 @@ fn score_matmul() void {
 }
 
 fn softmax_score() void {
+
+    // wyn: DEBUG — snapshot head-0 raw score before alpha/mask/softmax modify it
+    if (head_idx == 0) {
+        @fmovh(score_dbg_dsd, score_dsd);
+    }
 
     seqLen_dsd_1 = @set_dsd_base_addr(seqLen_dsd_1, ptr_score);
 
@@ -1265,6 +1286,10 @@ comptime {
     // wyn: export Z
     @export_symbol(ptr_Z, "Z");   // layer output after all processing
     @export_symbol(ptr_Z_mid, "Z_mid");   // wyn: post-attention residual (resid_mid)
+    @export_symbol(ptr_score_dbg, "score_dbg");   // wyn: DEBUG head-0 raw score
+    @export_symbol(ptr_xq_proj_dbg, "xq_proj_dbg");   // wyn: DEBUG head-0 XQ pre-rope
+    @export_symbol(ptr_xq_rope_dbg, "xq_rope_dbg");   // wyn: DEBUG head-0 XQ post-rope
+    @export_symbol(ptr_X_norm_backup, "X_norm_dbg");  // wyn: DEBUG pristine rmsnorm_x output
     // wyn: end
     @export_symbol(init_task);
     @export_symbol(prefill_host);

@@ -422,6 +422,29 @@ def main():
                           streaming=False, order=memcpy_order, data_type=io_dtype, nonblock=False)
         Zmid_1d = sdk_utils.memcpy_view(Zmid_1d_u32, np.dtype(np.float16))
         Zmid_layer0 = untile_flat_1d(Zmid_1d, P, seq_len_p_pe, dim_p_pe)   # (seq_len, dim)
+
+        # wyn: DEBUG — head-0 raw score [query, key], for attention isolation
+        sc_u32 = np.zeros(P * P * seq_len_p_pe * seq_len_p_pe, dtype=np.uint32)
+        runner.memcpy_d2h(sc_u32, runner.get_id("score_dbg"), 0, 0, P, P, seq_len_p_pe * seq_len_p_pe,
+                          streaming=False, order=memcpy_order, data_type=io_dtype, nonblock=False)
+        sc = sdk_utils.memcpy_view(sc_u32, np.dtype(np.float16))
+        score_dbg = untile_flat_1d(sc, P, seq_len_p_pe, seq_len_p_pe)   # [query, key]
+        np.save("csl_dbg_score.npy", score_dbg)
+
+        # wyn: DEBUG — head-0 XQ pre/post rope [seq, head_dim] (cols in rope-perm order)
+        def _read_xq(sym):
+            b = np.zeros(P * P * seq_len_p_pe * head_dim_p_pe, dtype=np.uint32)
+            runner.memcpy_d2h(b, runner.get_id(sym), 0, 0, P, P, seq_len_p_pe * head_dim_p_pe,
+                              streaming=False, order=memcpy_order, data_type=io_dtype, nonblock=False)
+            return untile_flat_1d(sdk_utils.memcpy_view(b, np.dtype(np.float16)), P, seq_len_p_pe, head_dim_p_pe)
+        np.save("csl_dbg_xq_proj.npy", _read_xq("xq_proj_dbg"))
+        np.save("csl_dbg_xq_rope.npy", _read_xq("xq_rope_dbg"))
+
+        # wyn: DEBUG — pristine rmsnorm_x output [seq, dim]
+        xn_u32 = np.zeros(P * P * seq_len_p_pe * dim_p_pe, dtype=np.uint32)
+        runner.memcpy_d2h(xn_u32, runner.get_id("X_norm_dbg"), 0, 0, P, P, seq_len_p_pe * dim_p_pe,
+                          streaming=False, order=memcpy_order, data_type=io_dtype, nonblock=False)
+        np.save("csl_dbg_xnorm.npy", untile_flat_1d(sdk_utils.memcpy_view(xn_u32, np.dtype(np.float16)), P, seq_len_p_pe, dim_p_pe))
         # wyn: end
 
     time_start = np.zeros((P, P)).astype(int)
