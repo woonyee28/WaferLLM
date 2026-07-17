@@ -235,7 +235,7 @@ def main():
     # Pre-fetch all symbol handles right after run() (the launch_sim.py ordering).
     names = ["X", "W", "W2", "Q_weight", "K_weight", "V_weight", "O_weight",
              "freqs_sin", "freqs_cos", "UP_weight", "GATE_weight", "DOWN_weight",
-             "Z", "Z_mid", "score_dbg"]
+             "Z", "Z_mid", "score_dbg", "xk_trace"]
     syms = {}
     for nm in names:
         syms[nm] = runner.get_id(nm)
@@ -280,6 +280,7 @@ def main():
         Zmid_1d = d2h("Z_mid", seq_len_p_pe * dim_p_pe)
         Zmid = untile_flat_1d(Zmid_1d, P, seq_len_p_pe, dim_p_pe)     # [seq, dim]
         score_dbg_1d = d2h("score_dbg", seq_len_p_pe * seq_len_p_pe)
+        xk_trace_1d = d2h("xk_trace", P * seq_len_p_pe * head_dim_p_pe)
         Zfull_1d = d2h("Z", seq_len_p_pe * dim_p_pe)
         Zfull = untile_flat_1d(Zfull_1d, P, seq_len_p_pe, dim_p_pe) if Zfull_1d is not None else None
     finally:
@@ -332,6 +333,70 @@ def main():
     if Zfull is not None:
         print(f"\n|Z_full (after FFN)|={np.linalg.norm(Zfull):.4f}  "
               f"|Z_mid|={np.linalg.norm(Zmid):.4f}  |X|={np.linalg.norm(Xf):.4f}")
+
+    # ---- XK delivery trace: does every column hold the SAME key at each step? ----
+    # The reduce sums partials across px, which is only meaningful if all columns in a
+    # row hold chunks of one key row. Swapping the reduce for the validated fixed-root
+    # all-reduce left the even/odd fingerprint identical => the partials are suspect.
+    # Each trace value is matched back to its (key, head_dim col) by nearest value, so
+    # this is robust to any column permutation the rope/sharding may introduce.
+    if seq_len_p_pe == 1 and head_dim_p_pe == 1 and xk_trace_1d is not None:
+        xk = xk_trace_1d.reshape(P, P, P).astype(np.float64)          # [py, px, step]
+        Kg0 = (Xn @ Wk[:, 0:head_dim].astype(np.float32)).astype(np.float64)   # [key, head_dim]
+        flat = Kg0.ravel()                                            # idx = key*head_dim + d
+
+        def which_key(v):
+            j = int(np.argmin(np.abs(flat - v)))
+            return j // head_dim, float(abs(flat[j] - v))
+
+        def offset_step_of(py):
+            if py == 0:
+                return 0
+            if py % 2 == 0:
+                return P - (py // 2)
+            return (py + 1) // 2
+
+        f = reduce_root_map(P)
+        seen = np.full((P, P), -1, dtype=int)     # [py, step] key, or -1 if columns disagree
+        want = np.zeros((P, P), dtype=int)        # [py, step] key the deposit column implies
+        worst = 0.0
+        for py in range(P):
+            for s in range(P):
+                ks = []
+                for px in range(P):
+                    k, e = which_key(xk[py, px, s])
+                    ks.append(k)
+                    worst = max(worst, e)
+                seen[py, s] = ks[0] if len(set(ks)) == 1 else -1
+                want[py, s] = int(f[(offset_step_of(py) + s) % P])
+
+        print("\n--- XK delivery trace (head 0) ---")
+        print("key each row holds at each step (-1 = columns DISAGREE):  [py, step]")
+        print(seen)
+        print("key the deposit column f(co) implies it should be:        [py, step]")
+        print(want)
+        print(f"(worst nearest-value match residual: {worst:.4g} -- large means the")
+        print(" identification itself is unreliable, not the alignment)")
+
+        mixed = int((seen < 0).sum())
+        misaligned = int(((seen >= 0) & (seen != want)).sum())
+        print(f"\n  steps where columns disagree on the key: {mixed}/{P*P}")
+        print(f"  steps aligned but on the WRONG key:       {misaligned}/{P*P}")
+        if mixed:
+            bad_odd = all(seen[py, s] < 0
+                          for py in range(P) for s in range(P)
+                          if (offset_step_of(py) + s) % P % 2 == 1)
+            good_even = all(seen[py, s] >= 0
+                            for py in range(P) for s in range(P)
+                            if (offset_step_of(py) + s) % P % 2 == 0)
+            print(f"  all odd-co steps mixed: {bad_odd};  all even-co steps clean: {good_even}")
+            if bad_odd and good_even:
+                print("  => CONFIRMED: the XK two-hop shift delivers a settled key only on even co.")
+                print("     The reduce is innocent; mm_two_hop_comm_T / its rendezvous is the bug.")
+        elif misaligned:
+            print("  => XK delivery is CLEAN; the key->column mapping f(co) is what's wrong.")
+        else:
+            print("  => XK delivery is clean AND correctly aligned; look elsewhere.")
 
     if seq_len_p_pe == 1 and score_dbg_1d is not None:
         # score_dbg: PE(py,px) holds one raw score; grid[py,px] = score[query=py, key=?]

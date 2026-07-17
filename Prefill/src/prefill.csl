@@ -246,6 +246,14 @@ var score_dbg: [seq_len_p_pe * seq_len_p_pe]f16 = @zeros([seq_len_p_pe * seq_len
 var ptr_score_dbg: [*]f16 = &score_dbg;
 var score_dbg_dsd = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{seq_len_p_pe * seq_len_p_pe} -> score_dbg[i] });
 
+// wyn: DEBUG — head-0 trace of the XK tile each PE actually multiplies at systolic step s.
+// The reduce sums partials across px, which is only meaningful if every column in a row
+// holds a chunk of the SAME key row. The even-co/odd-co fingerprint survived swapping the
+// reduce for the validated fixed-root all-reduce, so the partials themselves are suspect:
+// this reads out which key each (px,py) holds at each step.
+var xk_trace: [P * seq_len_p_pe * head_dim_p_pe]f16 = @zeros([P * seq_len_p_pe * head_dim_p_pe]f16);
+var ptr_xk_trace: [*]f16 = &xk_trace;
+
 var h1_tile: [seq_len_p_pe * dim_p_pe]f16 = @zeros([seq_len_p_pe * dim_p_pe]f16);
 var ptr_h1: [*]f16 = &h1_tile;
 var h1_dsd = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{seq_len_p_pe * dim_p_pe} -> h1_tile[i] });
@@ -383,29 +391,14 @@ fn matmul_T_reduce_add() void {
         reduce_root = 2 * (P - current_offset);
     }
 
-    // wyn: matmul_T_reduce_add_x gathers toward a *variable* root, so PEs flip send
-    // direction between consecutive steps on the shared c_right/c_left queues. Verified
-    // on the P=8 sim: the sum is only correct on alternate steps (even co bit-exact,
-    // odd co garbage). reduce_root above is still the right destination -- only the sum
-    // is broken -- so take the sum from the fixed-root all-reduce (same primitive
-    // rmsnorm/softmax use) and select the destination locally. f(co) is a bijection, so
-    // each column stores exactly once => score row in natural key order for the mask.
-    // Guarded on seq_len_p_pe==1: mv_allreduce_add_x carries seq_len_p_pe elements but
-    // the score tile is seq_len_p_pe^2; they coincide only at 1 (the P=128 regime).
-    if (seq_len_p_pe == 1) {
-        comm_mod.mv_allreduce_add_x(ptr_seqLen_seqLen_tmp);
+    // wyn: NOT the bug. Swapping this for the fixed-root mv_allreduce_add_x (verified
+    // correct, as rmsnorm/softmax rely on it) left the even-co/odd-co fingerprint
+    // identical on the P=8 sim => the sum is fine, the partials it sums are wrong on
+    // odd co. Look at the XK delivery in mm_two_hop_comm_T, not here.
+    comm_mod.matmul_T_reduce_add_x(reduce_root, ptr_seqLen_seqLen_tmp, ptr_score);
 
-        if (px == reduce_root) {
-            ptr_score[0] = ptr_seqLen_seqLen_tmp[0];
-        }
-
-        ptr_seqLen_seqLen_tmp[0] = 0.0;
-    } else {
-        comm_mod.matmul_T_reduce_add_x(reduce_root, ptr_seqLen_seqLen_tmp, ptr_score);
-
-        @load_to_dsr(comp_dest_dsr_1, seqLen_seqLen_tmp_dsd);
-        @fmovh(comp_dest_dsr_1, 0.0);
-    }
+    @load_to_dsr(comp_dest_dsr_1, seqLen_seqLen_tmp_dsd);
+    @fmovh(comp_dest_dsr_1, 0.0);
 }
 
 fn matmul_T_compute() void {
@@ -421,6 +414,13 @@ fn matmul_T_compute() void {
 
         left_matrix_dsd = @set_dsd_base_addr(left_matrix_dsd, ptr_left_matrix_send);
         right_matrix_dsd = @set_dsd_base_addr(right_matrix_dsd, ptr_right_matrix_send);
+
+        // wyn: DEBUG snapshot the K chunk this PE multiplies at step `step` (head 0 only).
+        if (head_idx == 0) {
+            for (@range(i16, seq_len_p_pe * head_dim_p_pe)) |i| {
+                xk_trace[step * seq_len_p_pe * head_dim_p_pe + i] = ptr_right_matrix_send[i];
+            }
+        }
 
         for (@range(i16, Kt)) |k| {
 
@@ -1309,6 +1309,7 @@ comptime {
     @export_symbol(ptr_xq_proj_dbg, "xq_proj_dbg");   // wyn: DEBUG head-0 XQ pre-rope
     @export_symbol(ptr_xq_rope_dbg, "xq_rope_dbg");   // wyn: DEBUG head-0 XQ post-rope
     @export_symbol(ptr_X_norm_backup, "X_norm_dbg");  // wyn: DEBUG pristine rmsnorm_x output
+    @export_symbol(ptr_xk_trace, "xk_trace");     // wyn: DEBUG head-0 per-step XK tile
     // wyn: end
     @export_symbol(init_task);
     @export_symbol(prefill_host);
