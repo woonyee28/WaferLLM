@@ -260,6 +260,14 @@ var score_dbg_dsd = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{seq_len_p_pe * s
 var xk_trace: [P * seq_len_p_pe * head_dim_p_pe]f16 = @zeros([P * seq_len_p_pe * head_dim_p_pe]f16);
 var ptr_xk_trace: [*]f16 = &xk_trace;
 
+// wyn: DEBUG — head-0 inputs to output_matmul, snapshotted where it consumes them. The raw
+// score is validated (cos 0.999999) but attention output is still wrong, so the two never-
+// checked stages are the softmax/causal-mask output (probs) and the V projection.
+var probs_dbg: [seq_len_p_pe * seq_len_p_pe]f16 = @zeros([seq_len_p_pe * seq_len_p_pe]f16);
+var ptr_probs_dbg: [*]f16 = &probs_dbg;
+var xv_dbg: [seq_len_p_pe * head_dim_p_pe]f16 = @zeros([seq_len_p_pe * head_dim_p_pe]f16);
+var ptr_xv_dbg: [*]f16 = &xv_dbg;
+
 var h1_tile: [seq_len_p_pe * dim_p_pe]f16 = @zeros([seq_len_p_pe * dim_p_pe]f16);
 var ptr_h1: [*]f16 = &h1_tile;
 var h1_dsd = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{seq_len_p_pe * dim_p_pe} -> h1_tile[i] });
@@ -888,6 +896,16 @@ fn output_matmul() void {
     @load_to_dsr(comp_dest_dsr_1, output_dsd);
     @fmovh(comp_dest_dsr_1, 0.0);
 
+    // wyn: DEBUG snapshot the two operands of output = probs @ XV, exactly as consumed.
+    if (head_idx == 0) {
+        for (@range(i16, seq_len_p_pe * seq_len_p_pe)) |i| {
+            probs_dbg[i] = score[i];
+        }
+        for (@range(i16, seq_len_p_pe * head_dim_p_pe)) |i| {
+            xv_dbg[i] = XV_tile[i];
+        }
+    }
+
     ptr_left_matrix_send = &seqLen_seqLen_tmp;
     ptr_left_matrix_recv = &score;
 
@@ -1347,6 +1365,8 @@ comptime {
     @export_symbol(ptr_xq_rope_dbg, "xq_rope_dbg");   // wyn: DEBUG head-0 XQ post-rope
     @export_symbol(ptr_X_norm_backup, "X_norm_dbg");  // wyn: DEBUG pristine rmsnorm_x output
     @export_symbol(ptr_xk_trace, "xk_trace");     // wyn: DEBUG head-0 per-step XK tile
+    @export_symbol(ptr_probs_dbg, "probs_dbg");   // wyn: DEBUG head-0 post-softmax probs
+    @export_symbol(ptr_xv_dbg, "xv_dbg");         // wyn: DEBUG head-0 XV as output_matmul sees it
     // wyn: end
     @export_symbol(init_task);
     @export_symbol(prefill_host);

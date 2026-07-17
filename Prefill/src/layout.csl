@@ -281,6 +281,8 @@ layout {
     @export_name("xq_rope_dbg", [*]f16, true);
     @export_name("X_norm_dbg", [*]f16, true);
     @export_name("xk_trace", [*]f16, true);
+    @export_name("probs_dbg", [*]f16, true);
+    @export_name("xv_dbg", [*]f16, true);
     // wyn: end
 
     @export_name("init_task", fn()void);

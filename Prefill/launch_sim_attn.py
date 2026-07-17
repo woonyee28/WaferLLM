@@ -235,7 +235,7 @@ def main():
     # Pre-fetch all symbol handles right after run() (the launch_sim.py ordering).
     names = ["X", "W", "W2", "Q_weight", "K_weight", "V_weight", "O_weight",
              "freqs_sin", "freqs_cos", "UP_weight", "GATE_weight", "DOWN_weight",
-             "Z", "Z_mid", "score_dbg", "xk_trace"]
+             "Z", "Z_mid", "score_dbg", "xk_trace", "probs_dbg", "xv_dbg"]
     syms = {}
     for nm in names:
         syms[nm] = runner.get_id(nm)
@@ -281,6 +281,8 @@ def main():
         Zmid = untile_flat_1d(Zmid_1d, P, seq_len_p_pe, dim_p_pe)     # [seq, dim]
         score_dbg_1d = d2h("score_dbg", seq_len_p_pe * seq_len_p_pe)
         xk_trace_1d = d2h("xk_trace", P * seq_len_p_pe * head_dim_p_pe)
+        probs_dbg_1d = d2h("probs_dbg", seq_len_p_pe * seq_len_p_pe)
+        xv_dbg_1d = d2h("xv_dbg", seq_len_p_pe * head_dim_p_pe)
         Zfull_1d = d2h("Z", seq_len_p_pe * dim_p_pe)
         Zfull = untile_flat_1d(Zfull_1d, P, seq_len_p_pe, dim_p_pe) if Zfull_1d is not None else None
     finally:
@@ -301,11 +303,14 @@ def main():
         raw = Qh @ Kg.T
         if h == 0:
             raw_score_h0 = raw.copy()
+            Vg_h0 = Vg.copy()
         S = raw * alpha
         S[causal] = -np.inf
         S = S - S.max(axis=1, keepdims=True)
         e = np.exp(S)
         Pr = e / e.sum(axis=1, keepdims=True)
+        if h == 0:
+            probs_h0 = Pr.copy()
         Oh = Pr @ Vg
         attn += Oh @ Wo[h * head_dim:(h + 1) * head_dim, :].astype(np.float32)
     Zmid_oracle = Xf + attn
@@ -333,6 +338,39 @@ def main():
     if Zfull is not None:
         print(f"\n|Z_full (after FFN)|={np.linalg.norm(Zfull):.4f}  "
               f"|Z_mid|={np.linalg.norm(Zmid):.4f}  |X|={np.linalg.norm(Xf):.4f}")
+
+    # ---- output_matmul operands: probs (softmax+causal mask) and XV (V projection) ----
+    # The raw score is validated, so if attention is still wrong the fault is in one of
+    # these two, or in output_matmul/O-proj if both are clean.
+    if seq_len_p_pe == 1 and head_dim_p_pe == 1:
+        # rope runs with cos=1/sin=0 (identity), but tolerate an adjacent-pair column swap
+        sw_v = np.arange(head_dim)
+        sw_v[0::2], sw_v[1::2] = np.arange(1, head_dim, 2), np.arange(0, head_dim, 2)
+
+        if probs_dbg_1d is not None:
+            probs_k = probs_dbg_1d.reshape(P, P).astype(np.float64)     # [query=py, key=px]
+            print("\n--- head-0 probs (post-softmax, post-causal-mask) ---")
+            report("probs", probs_k, probs_h0)
+            print("kernel probs [py, px]:")
+            print(probs_k)
+            print("oracle probs [query, key]:")
+            print(probs_h0.astype(np.float64))
+            # The causal mask must zero every key > query. Check that structurally: a
+            # nonzero upper triangle means the mask is masking the wrong keys (or not at
+            # all); rows not summing to 1 mean the softmax normalisation is off.
+            upper = np.triu(np.ones((P, P), dtype=bool), k=1)
+            print(f"  max prob above the diagonal (must be ~0): {np.abs(probs_k[upper]).max():.4g}")
+            print("  row sums (must all be 1.0):", np.round(probs_k.sum(axis=1), 4))
+
+        if xv_dbg_1d is not None:
+            xv_k = xv_dbg_1d.reshape(P, P).astype(np.float64)           # [py, px]
+            print("\n--- head-0 XV (V projection, as output_matmul consumes it) ---")
+            report("XV", xv_k, Vg_h0.astype(np.float64))
+            e_direct = np.abs(xv_k - Vg_h0).max(axis=1)
+            e_swap = np.abs(xv_k - Vg_h0[:, sw_v]).max(axis=1)
+            print("  per-row max|XV - V|:", np.round(np.minimum(e_direct, e_swap), 4))
+            print("  offset_step(py)    :", [0 if py == 0 else (P - py // 2 if py % 2 == 0
+                                             else (py + 1) // 2) for py in range(P)])
 
     # ---- XK delivery trace: does every column hold the SAME key at each step? ----
     # The reduce sums partials across px, which is only meaningful if all columns in a
