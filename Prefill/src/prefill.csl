@@ -78,7 +78,21 @@ var in_preshift: bool = false;
 var pre_remaining: i16 = 0;
 var shift_round: i16 = 0;
 
+// wyn: the RIGHT operand's skew, mirroring the left's. A mesh GEMM needs right[i,j] to hold
+// contraction block ind[i,j]; the host does that for every weight (t = ind[i,j] in the shard
+// fns). output_matmul is the only GEMM whose right operand is on-chip (XV), so it must be
+// skewed here. Verified numerically for P=8/16/32/128: ind is symmetric and
+//     ind[i,j] == sigma^offset_step(i) (j),   sigma = the f-cycle (0 1 3 5 7 6 4 2)
+// so ind[i,j] == sigma^offset_step(j) (i) — a per-COLUMN VERTICAL walk of offset_step(px)
+// hops, the exact mirror of the left's per-row horizontal walk of offset_step(py) hops.
+// mm_two_hop_comm_T is already exactly that vertical shift, and xk_trace measured its
+// direction as +sigma per hop, so offset_step(px) hops of it produce V[sigma^os(px)(i), j].
+var in_preshift_r: bool = false;
+var pre_remaining_r: i16 = 0;
+var shift_round_r: i16 = 0;
+
 var offset_step: i16 = 0;
+var offset_step_px: i16 = 0;
 var current_offset: i16 = 0;
 
 var step: i16 = 0;
@@ -120,6 +134,15 @@ fn init_task() void {
         offset_step = P - (py / 2);
     } else {
         offset_step = (py + 1) / 2;
+    }
+
+    // wyn: the same walk length, but keyed on px — the right operand's vertical skew.
+    if (px == 0) {
+        offset_step_px = 0;
+    } else if (px % 2 == 0) {
+        offset_step_px = P - (px / 2);
+    } else {
+        offset_step_px = (px + 1) / 2;
     }
 
     comm_mod.init_(px, py);
@@ -376,6 +399,33 @@ fn left_matrix_shift_callback() void {
     }
 }
 
+// wyn: vertical pre-skew of the RIGHT operand, used only by output_matmul (every other GEMM
+// gets a right operand the host already skewed by ind[i,j]). mm_two_hop_comm_T IS the pure
+// vertical shift of a seqLen_headDim tile — the same one matmul_T uses per step — so no new
+// comm routine is needed. Each hop swaps then shifts, so the tile lands in recv and
+// matmul_compute's own swap puts it back in send: the same invariant as the left pre-shift.
+// When the skew is done, chain straight into the left pre-shift, then the matmul.
+fn right_matrix_shift_callback() void {
+    if (pre_remaining_r > 0) {
+        pre_remaining_r -= 1;
+
+        swap_ptr = ptr_right_matrix_send;
+        ptr_right_matrix_send = ptr_right_matrix_recv;
+        ptr_right_matrix_recv = swap_ptr;
+
+        comm_mod.mm_two_hop_comm_T(ptr_right_matrix_send, ptr_right_matrix_recv, shift_round_r);
+        shift_round_r += 1;
+
+    } else {
+        in_preshift_r = false;
+
+        in_preshift = true;
+        pre_remaining = offset_step;
+        shift_round = 0;
+        left_matrix_shift_callback();
+    }
+}
+
 task left_matrix_finish() void {
     @block(left_matrix_finish_id);
     if (in_preshift) {
@@ -387,7 +437,11 @@ task left_matrix_finish() void {
 
 task right_matrix_finish() void {
     @block(right_matrix_finish_id);
-    @activate(two_hop_comm_finish_id);
+    if (in_preshift_r) {
+        right_matrix_shift_callback();
+    } else {
+        @activate(two_hop_comm_finish_id);
+    }
 }
 
 task two_hop_comm_finish() void {
@@ -901,19 +955,18 @@ fn softmax_score() void {
 
 fn output_matmul() void {
 
-    // wyn: OPEN BUG (13 Jul, P=8 sim). probs and XV are each validated to cos 1.0, yet
-    // output_h = probs @ XV comes out at cos 0.03. Cause: a mesh GEMM needs BOTH operands
-    // skewed -- the left by offset_step(py) (left_matrix_shift, below) and the right by the
-    // ind[i,j] contraction-block permutation. There is NO right_matrix_shift in the kernel:
-    // the right skew is applied ONLY by the host when sharding weights (shard_qkv_headmajor
-    // / shard_o_headmajor / the FFN sharding all index blocks by t = ind[i,j]).
-    // This is the ONLY GEMM whose right operand is on-chip data (XV_tile) instead of a
-    // host-sharded weight, so XV arrives in natural layout and is never ind-skewed.
-    // score_matmul is unaffected because matmul_T needs no skew (both operands natural).
-    // Fix direction: a vertical right_matrix_shift over the Y channel mirroring
-    // left_matrix_shift's Option-A reuse, pre-skewing XV by offset_step(px) hops.
-    // NB: this is upstream's structure, not something GQA introduced -- consistent with
-    // the single-head base config also failing (attn-contrib cos 0.36).
+    // wyn: BUG 2 (13 Jul, P=8 sim). A mesh GEMM needs BOTH operands skewed: the left by
+    // offset_step(py) (left_matrix_shift) and the right by the ind[i,j] contraction-block
+    // permutation. The right skew is applied ONLY by the host when sharding weights
+    // (t = ind[i,j] in shard_qkv_headmajor / shard_o_headmajor / the FFN sharding), and this
+    // is the ONLY GEMM whose right operand is on-chip data (XV_tile) rather than a weight --
+    // so XV used to arrive natural and unskewed. Measured: probs cos 1.0 and XV cos 1.0, yet
+    // probs @ XV came out at cos 0.03, and the kernel's output matched probs @ V[indinv] to
+    // cos 0.999999 -- confirming it treated XV's natural layout as if it were ind-skewed.
+    // (score_matmul is unaffected: matmul_T needs no skew, both operands natural.)
+    // Fix: pre-skew XV vertically by offset_step(px) hops before the usual left pre-shift.
+    // NB: upstream's structure, not something GQA introduced -- consistent with the
+    // single-head base config also failing (attn-contrib cos 0.36).
 
     // Clearing
     @load_to_dsr(comp_dest_dsr_1, output_dsd);
@@ -950,10 +1003,13 @@ fn output_matmul() void {
 
     left_dim_length = Mt * Kt;
 
-    in_preshift = true;
-    pre_remaining = offset_step;
-    shift_round = 0;
-    left_matrix_shift_callback();
+    // wyn: skew XV vertically by offset_step(px) hops first; its callback then kicks off the
+    // usual left pre-shift and the matmul. (Every other GEMM starts straight at the left
+    // pre-shift because the host already skewed its right operand.)
+    in_preshift_r = true;
+    pre_remaining_r = offset_step_px;
+    shift_round_r = 0;
+    right_matrix_shift_callback();
 }
 
 fn h1_matmul() void {
