@@ -345,6 +345,75 @@ def main():
         print(f"\n|Z_full (after FFN)|={np.linalg.norm(Zfull):.4f}  "
               f"|Z_mid|={np.linalg.norm(Zmid):.4f}  |X|={np.linalg.norm(Xf):.4f}")
 
+    # ========================= FFN =========================
+    # Two lessons carried over from the attention debug:
+    #  (1) The aggregate cosine LIES. |Z_full| ~ |Z_mid| + a small correction, so the full-Z
+    #      cosine hides FFN error exactly as Z_mid 0.95 hid attention at 0.16. Use the
+    #      FFN-CONTRIBUTION cosine, cos(Z - Z_mid, ffn_ref(Z_mid)).
+    #  (2) Drive the oracle from the KERNEL's own Z_mid, so attention error cannot leak in
+    #      and the FFN is tested in isolation.
+    # And the specific hypothesis: z2_matmul (gate) is structurally identical to the
+    # xk_matmul buffer-parity bug -- it hardcodes Z_norm_tile and skips the pre-shift,
+    # trusting z1_matmul to have left the shifted Z there. If that mechanism applies, the
+    # error must split by offset_step PARITY, per row.
+    if Zfull is not None:
+        def ffn_ref(z):
+            z = z.astype(np.float64)
+            ms_ = np.mean(z ** 2, axis=1, keepdims=True)
+            zn = z / np.sqrt(ms_ + eps)                     # rmsnorm_z (W2 = ones)
+            up = zn @ Wup.astype(np.float64)                # z1_matmul
+            gate = zn @ Wgate.astype(np.float64)            # z2_matmul
+            z3 = (gate / (1.0 + np.exp(-gate))) * up        # z3_comp: silu(gate) * up
+            return z3 @ Wdown.astype(np.float64)            # h2_matmul
+
+        Zmid_k = Zmid.astype(np.float64)
+        ffn_oracle = ffn_ref(Zmid_k)
+        ffn_kernel = Zfull.astype(np.float64) - Zmid_k
+
+        print("\n=========================== FFN ===========================")
+        print("--- full Z (incl. Z_mid passthrough -- CAN HIDE FFN ERROR) ---")
+        report("Z_full", Zfull.astype(np.float64), Zmid_k + ffn_oracle)
+        print("\n--- FFN CONTRIBUTION (Z - Z_mid); oracle driven by the KERNEL's Z_mid ---")
+        report("ffn-contrib", ffn_kernel, ffn_oracle)
+        print(f"   |ffn_kernel|={np.linalg.norm(ffn_kernel):.4f}  "
+              f"|ffn_oracle|={np.linalg.norm(ffn_oracle):.4f}")
+
+        # per-row breakdown against offset_step parity -- the z2_matmul hypothesis
+        def _os(py):
+            if py == 0:
+                return 0
+            if py % 2 == 0:
+                return P - (py // 2)
+            return (py + 1) // 2
+
+        row_err = np.abs(ffn_kernel - ffn_oracle).max(axis=1)
+        row_cos = np.array([
+            float(np.dot(ffn_kernel[r], ffn_oracle[r]) /
+                  (np.linalg.norm(ffn_kernel[r]) * np.linalg.norm(ffn_oracle[r]) + 1e-30))
+            for r in range(seq_len)])
+        os_of_row = [_os(r // seq_len_p_pe) for r in range(seq_len)]
+
+        print("\n  per-row FFN diagnosis (z2_matmul buffer-parity hypothesis):")
+        print("   row | py | offset_step | parity | max_abs_err | row cosine")
+        for r in range(seq_len):
+            o = os_of_row[r]
+            print(f"   {r:3d} | {r // seq_len_p_pe:2d} |     {o:3d}     |  "
+                  f"{'even' if o % 2 == 0 else 'odd '}  |  {row_err[r]:9.4f}  |  {row_cos[r]:.6f}")
+
+        ev = [row_cos[r] for r in range(seq_len) if os_of_row[r] % 2 == 0]
+        od = [row_cos[r] for r in range(seq_len) if os_of_row[r] % 2 == 1]
+        if ev and od:
+            print(f"\n  mean row cosine -- even offset_step: {np.mean(ev):.6f}   "
+                  f"odd: {np.mean(od):.6f}")
+            if np.mean(od) < 0.9 <= np.mean(ev):
+                print("  => CONFIRMED: z2_matmul has the SAME buffer-parity bug xk_matmul had.")
+                print("     Fix identically: swap into recv rather than naming Z_norm_tile.")
+            elif min(np.mean(ev), np.mean(od)) > 0.99:
+                print("  => FFN is clean per-row: NO buffer-parity bug. Any remaining gap is")
+                print("     fp16 accumulation, and the 0.986 device figure is honest.")
+            else:
+                print("  => FFN error does NOT split by offset_step parity -- a different bug.")
+
     # ---- output_matmul operands: probs (softmax+causal mask) and XV (V projection) ----
     # The raw score is validated, so if attention is still wrong the fault is in one of
     # these two, or in output_matmul/O-proj if both are clean.

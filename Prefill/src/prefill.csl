@@ -955,7 +955,8 @@ fn softmax_score() void {
 
 fn output_matmul() void {
 
-    // wyn: BUG 2 (13 Jul, P=8 sim). A mesh GEMM needs BOTH operands skewed: the left by
+    // wyn: BUG 2 -- FIXED 13 Jul, P=8 sim: attn-contrib cos 0.999999 (was -0.116).
+    // A mesh GEMM needs BOTH operands skewed: the left by
     // offset_step(py) (left_matrix_shift) and the right by the ind[i,j] contraction-block
     // permutation. The right skew is applied ONLY by the host when sharding weights
     // (t = ind[i,j] in shard_qkv_headmajor / shard_o_headmajor / the FFN sharding), and this
