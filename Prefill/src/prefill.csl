@@ -108,6 +108,12 @@ fn init_task() void {
     py = @as(i16, layout_mod.get_y_coord());
 
     // * offset_step: forward pre-shift hop count AND offset in the 2-hop reduce order
+    //
+    // wyn: offset_step PARITY was the attention bug (13 Jul, P=8 sim). Each pre-shift hop
+    // swaps the left send/recv buffers, so after a projection the shifted tile sits in a
+    // buffer determined by offset_step's parity -- and xk_matmul/xv_matmul used to hardcode
+    // which buffer that was. Measured: XK exact for even offset_step (py 0,3,4,7 at P=8),
+    // garbage for odd (py 1,2,5,6). See the note in xk_matmul and devlogs/13July26.md PART 6.
     if (py == 0) {
         offset_step = 0;
     } else if (py % 2 == 0) {
@@ -247,10 +253,10 @@ var ptr_score_dbg: [*]f16 = &score_dbg;
 var score_dbg_dsd = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{seq_len_p_pe * seq_len_p_pe} -> score_dbg[i] });
 
 // wyn: DEBUG — head-0 trace of the XK tile each PE actually multiplies at systolic step s.
-// The reduce sums partials across px, which is only meaningful if every column in a row
-// holds a chunk of the SAME key row. The even-co/odd-co fingerprint survived swapping the
-// reduce for the validated fixed-root all-reduce, so the partials themselves are suspect:
-// this reads out which key each (px,py) holds at each step.
+// This is what localised the attention bug: its step-0 slice (before any score shift) shows
+// XK already corrupt for odd-offset_step rows, which cleared both the reduce and the score
+// matmul and pointed at the K projection. Keep it until attention is validated end to end;
+// the host side reads it in launch_sim_attn.py ("K projection sanity" check).
 var xk_trace: [P * seq_len_p_pe * head_dim_p_pe]f16 = @zeros([P * seq_len_p_pe * head_dim_p_pe]f16);
 var ptr_xk_trace: [*]f16 = &xk_trace;
 
@@ -328,6 +334,13 @@ const comp_src1_dsr_2 = @get_dsr(dsr_src1, 2);
 // Forward-only X pre-shift (Option A). Each hop swaps so the just-received tile
 // becomes the next send, runs over the shared X mesh channel, and completes on
 // left_matrix_finish_id — which, while in_preshift is set, dispatches back here.
+//
+// wyn: this routine is CORRECT for any hop count -- traced 13 Jul. Each hop swaps then
+// shifts, so the working tile always lands in recv, and matmul_compute's own swap then
+// puts it back in send. Verified for offset_step = 0, odd and even.
+// BUT it leaves the tile in a buffer whose identity depends on offset_step PARITY, and
+// callers that hardcode which buffer to read (xk_matmul/xv_matmul) get it wrong for one
+// parity. See the note on xk_matmul.
 fn left_matrix_shift_callback() void {
     if (pre_remaining > 0) {
         pre_remaining -= 1;
@@ -391,10 +404,13 @@ fn matmul_T_reduce_add() void {
         reduce_root = 2 * (P - current_offset);
     }
 
-    // wyn: NOT the bug. Swapping this for the fixed-root mv_allreduce_add_x (verified
-    // correct, as rmsnorm/softmax rely on it) left the even-co/odd-co fingerprint
-    // identical on the P=8 sim => the sum is fine, the partials it sums are wrong on
-    // odd co. Look at the XK delivery in mm_two_hop_comm_T, not here.
+    // wyn: NOT the bug -- do not "fix" this again. Swapping it for the fixed-root
+    // mv_allreduce_add_x (verified correct; rmsnorm/softmax rely on it) left the
+    // even-co/odd-co fingerprint identical on the P=8 sim, which proves the sum is fine.
+    // The score matmul is innocent too: at score step 0, before any shift, XK is already
+    // corrupt for odd-offset_step rows. Root cause was the K projection reading the wrong
+    // buffer -- see the note in xk_matmul. "Only even co is right" just means "the row
+    // currently holds one of the keys whose projection survived".
     comm_mod.matmul_T_reduce_add_x(reduce_root, ptr_seqLen_seqLen_tmp, ptr_score);
 
     @load_to_dsr(comp_dest_dsr_1, seqLen_seqLen_tmp_dsd);
@@ -600,8 +616,19 @@ fn xk_matmul() void {
     @load_to_dsr(comp_dest_dsr_1, XK_dsd);
     @fmovh(comp_dest_dsr_1, 0.0);
 
-    ptr_left_matrix_send = &seqLen_dim_tmp;
-    ptr_left_matrix_recv = &X_norm_tile;
+    // wyn: THE ATTENTION BUG (13 Jul, found on the P=8 sim). This used to hardcode
+    //     ptr_left_matrix_send = &seqLen_dim_tmp;  ptr_left_matrix_recv = &X_norm_tile;
+    // i.e. it assumed xq_matmul left the shifted X in X_norm_tile. It does not: the
+    // pre-shift does offset_step swaps and matmul_compute does P+1 more, so the tile
+    // ends in X_norm_tile only when offset_step is EVEN; for odd offset_step it is in
+    // seqLen_dim_tmp and this projected a stale buffer. Measured: XK rows were exact
+    // for py with even offset_step (0,3,4,7 at P=8) and garbage for odd (1,2,5,6),
+    // which downstream looked like "the score reduce is wrong on odd co".
+    // Fix: don't name the buffer -- matmul_compute leaves the working tile in
+    // ptr_left_matrix_send, and swaps on entry, so just swap it into recv here.
+    swap_ptr = ptr_left_matrix_send;
+    ptr_left_matrix_send = ptr_left_matrix_recv;
+    ptr_left_matrix_recv = swap_ptr;
 
     ptr_right_matrix_send = &dim_dim_tmp;
     // wyn: project KV head kv_head_idx's slice of K -> XK_g [seq, head_dim]
@@ -622,7 +649,7 @@ fn xk_matmul() void {
 
     left_dim_length = Mt * Kt;
 
-    matmul_compute(); // X_norm has been already shifted in xq_matmul
+    matmul_compute(); // reuses the X_norm xq_matmul already shifted (see buffer note above)
 }
 
 fn xv_matmul() void {
@@ -631,8 +658,11 @@ fn xv_matmul() void {
     @load_to_dsr(comp_dest_dsr_1, XV_dsd);
     @fmovh(comp_dest_dsr_1, 0.0);
 
-    ptr_left_matrix_send = &seqLen_dim_tmp;
-    ptr_left_matrix_recv = &X_norm_tile;
+    // wyn: same buffer-parity bug as xk_matmul -- see the note there. Reuse whatever
+    // buffer xk_matmul's matmul_compute left the shifted X in rather than naming one.
+    swap_ptr = ptr_left_matrix_send;
+    ptr_left_matrix_send = ptr_left_matrix_recv;
+    ptr_left_matrix_recv = swap_ptr;
 
     ptr_right_matrix_send = &dim_dim_tmp;
     // wyn: project KV head kv_head_idx's slice of V -> XV_g [seq, head_dim]
@@ -653,7 +683,7 @@ fn xv_matmul() void {
 
     left_dim_length = Mt * Kt;
 
-    matmul_compute(); // X_norm has been already shifted in xq_matmul
+    matmul_compute(); // reuses the X_norm xq_matmul already shifted (see buffer note above)
 }
 
 // wyn: head_dim_p_pe==1 rope — the pair's other dim lives on the neighbor column-PE, so swap
@@ -1038,6 +1068,13 @@ fn z2_matmul() void {
     @load_to_dsr(comp_dest_dsr_1, z2_dsd);
     @fmovh(comp_dest_dsr_1, 0.0);
 
+    // wyn: OPEN QUESTION (13 Jul). This is structurally IDENTICAL to the xk_matmul bug --
+    // it hardcodes Z_norm_tile as the buffer z1_matmul left the shifted Z in, but that is
+    // only true when offset_step is even. By that reasoning the gate projection should be
+    // wrong for odd-offset_step rows, yet the FFN validates at cos 0.986, which half-broken
+    // rows cannot produce. So either the mechanism differs here or the FFN has a latent bug
+    // the aggregate cosine hides. NOT changed until attention is fixed and understood --
+    // check per-row FFN error before touching this.
     ptr_left_matrix_send = &seqLen_dim_tmp;
     ptr_left_matrix_recv = &Z_norm_tile;
 
