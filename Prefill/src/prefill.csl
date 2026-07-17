@@ -1171,15 +1171,21 @@ fn z2_matmul() void {
     @load_to_dsr(comp_dest_dsr_1, z2_dsd);
     @fmovh(comp_dest_dsr_1, 0.0);
 
-    // wyn: OPEN QUESTION (13 Jul). This is structurally IDENTICAL to the xk_matmul bug --
-    // it hardcodes Z_norm_tile as the buffer z1_matmul left the shifted Z in, but that is
-    // only true when offset_step is even. By that reasoning the gate projection should be
-    // wrong for odd-offset_step rows, yet the FFN validates at cos 0.986, which half-broken
-    // rows cannot produce. So either the mechanism differs here or the FFN has a latent bug
-    // the aggregate cosine hides. NOT changed until attention is fixed and understood --
-    // check per-row FFN error before touching this.
-    ptr_left_matrix_send = &seqLen_dim_tmp;
-    ptr_left_matrix_recv = &Z_norm_tile;
+    // wyn: SAME BUG AS xk_matmul -- confirmed on the P=8 sim 13 Jul, and it was NOT the
+    // "fp16 accumulation" the 0.986 was blamed on. This used to hardcode
+    //     ptr_left_matrix_send = &seqLen_dim_tmp;  ptr_left_matrix_recv = &Z_norm_tile;
+    // i.e. it assumed z1_matmul left the shifted Z in Z_norm_tile. It does not: the pre-shift
+    // does offset_step swaps and matmul_compute does P+1 more, so the tile ends in
+    // Z_norm_tile only when offset_step is EVEN; for odd it is in seqLen_dim_tmp and the gate
+    // projection read a stale buffer. Measured per-row FFN-contribution cosine:
+    //     even offset_step -> 0.999996      odd offset_step -> 0.243  (one row NEGATIVE)
+    // The aggregate cos 0.9859 hid it -- and reproduced the device's 0.986 at ffn_dim=32,
+    // where fp16 accumulation is negligible, proving the gap was this bug all along.
+    // Fix (as xk/xv): don't name the buffer -- matmul_compute leaves the working tile in
+    // ptr_left_matrix_send and swaps on entry, so just swap it into recv here.
+    swap_ptr = ptr_left_matrix_send;
+    ptr_left_matrix_send = ptr_left_matrix_recv;
+    ptr_left_matrix_recv = swap_ptr;
 
     ptr_right_matrix_send = &dim_ffnDim_tmp;
     ptr_right_matrix_recv = &GATE_weight_tile;
