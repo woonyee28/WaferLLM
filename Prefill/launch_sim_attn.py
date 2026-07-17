@@ -390,6 +390,26 @@ def main():
         e_swap = np.abs(out_k - Oh_h0[:, sw_v]).max(axis=1)
         print("  per-row max|output_h - Oh|:", np.round(np.minimum(e_direct, e_swap), 4))
 
+        # ---- BUG 2 hypothesis, tested exactly ----
+        # A mesh GEMM needs right[i,j] to hold contraction block ind[i,j]; the host does this
+        # for every weight (t = ind[i,j] in the shard fns). XV is computed on-chip and stays
+        # natural, so the GEMM effectively multiplies by B_eff[m,j] = V[indinv[m,j], j].
+        # If the measured output matches probs @ B_eff, the mechanism is proven and the fix is
+        # exactly: make XV[i,j] hold V[ind[i,j], j] before output_matmul.
+        indinv = np.zeros((P, P), dtype=int)
+        for j in range(P):
+            for i in range(P):
+                indinv[ind[i, j], j] = i
+        B_eff = np.zeros((P, P), dtype=np.float64)
+        for m in range(P):
+            for j in range(P):
+                B_eff[m, j] = Vg_h0[indinv[m, j], j]
+        pred = probs_h0.astype(np.float64) @ B_eff
+        print("\n--- BUG 2 hypothesis: kernel computes probs @ V[indinv] (right operand unskewed) ---")
+        report("predicted output_h", out_k, pred)
+        print("  PASS here => confirmed: output_matmul needs XV[i,j] = V[ind[i,j], j].")
+        print("  FAIL here => the ind model is wrong; do NOT build the skew yet.")
+
     if seq_len_p_pe == 1 and h1_dbg_1d is not None:
         h1_k = untile_flat_1d(h1_dbg_1d, P, seq_len_p_pe, dim_p_pe)  # [seq, dim]
         print("\n--- h1 after head-0 O-proj only (head 0's contribution to attn) ---")
@@ -397,6 +417,16 @@ def main():
         print("  per-row max|h1 - Oh@Wo_h0|:",
               np.round(np.abs(h1_k.astype(np.float64) - h1_h0).max(axis=1), 4))
         print(f"  |h1_kernel|={np.linalg.norm(h1_k):.4f}  |h1_oracle|={np.linalg.norm(h1_h0):.4f}")
+
+        # Cross-check the ind model on a GEMM that WORKS: h1 = output_h @ Wo, whose right
+        # operand IS host-skewed. Predict h1 from the kernel's own (wrong) output_h -- if it
+        # matches, the O-proj is correct and merely inherits output_matmul's error, and the
+        # "host-skewed right operand => GEMM is correct" model holds.
+        if head_dim_p_pe == 1 and output_dbg_1d is not None:
+            h1_pred = out_k @ Wo[0:head_dim, :].astype(np.float64)
+            print("\n--- cross-check: h1 should equal (kernel's own output_h) @ Wo_h0 ---")
+            report("h1 from kernel output_h", h1_k.astype(np.float64), h1_pred)
+            print("  PASS => O-proj correct, only inherits output_matmul's error.")
 
     # ---- XK delivery trace: does every column hold the SAME key at each step? ----
     # The reduce sums partials across px, which is only meaningful if all columns in a

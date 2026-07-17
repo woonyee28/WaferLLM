@@ -901,6 +901,20 @@ fn softmax_score() void {
 
 fn output_matmul() void {
 
+    // wyn: OPEN BUG (13 Jul, P=8 sim). probs and XV are each validated to cos 1.0, yet
+    // output_h = probs @ XV comes out at cos 0.03. Cause: a mesh GEMM needs BOTH operands
+    // skewed -- the left by offset_step(py) (left_matrix_shift, below) and the right by the
+    // ind[i,j] contraction-block permutation. There is NO right_matrix_shift in the kernel:
+    // the right skew is applied ONLY by the host when sharding weights (shard_qkv_headmajor
+    // / shard_o_headmajor / the FFN sharding all index blocks by t = ind[i,j]).
+    // This is the ONLY GEMM whose right operand is on-chip data (XV_tile) instead of a
+    // host-sharded weight, so XV arrives in natural layout and is never ind-skewed.
+    // score_matmul is unaffected because matmul_T needs no skew (both operands natural).
+    // Fix direction: a vertical right_matrix_shift over the Y channel mirroring
+    // left_matrix_shift's Option-A reuse, pre-skewing XV by offset_step(px) hops.
+    // NB: this is upstream's structure, not something GQA introduced -- consistent with
+    // the single-head base config also failing (attn-contrib cos 0.36).
+
     // Clearing
     @load_to_dsr(comp_dest_dsr_1, output_dsd);
     @fmovh(comp_dest_dsr_1, 0.0);
