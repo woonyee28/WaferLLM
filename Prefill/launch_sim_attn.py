@@ -378,6 +378,31 @@ def main():
         print(f"(worst nearest-value match residual: {worst:.4g} -- large means the")
         print(" identification itself is unreliable, not the alignment)")
 
+        # At step 0 no shift has happened yet: every row must simply hold its own K row.
+        # If rows are already wrong here, the K PROJECTION is broken and the score shift
+        # is innocent (it just carries corrupt rows around). rope runs with cos=1/sin=0,
+        # which is identity, but check an adjacent-pair column swap too just in case.
+        sw = np.arange(head_dim)
+        sw[0::2], sw[1::2] = np.arange(1, head_dim, 2), np.arange(0, head_dim, 2)
+        xk0 = xk[:, :, 0]                                  # [py, px] at step 0
+        e_direct = np.abs(xk0 - Kg0).max(axis=1)           # per row
+        e_swap = np.abs(xk0 - Kg0[:, sw]).max(axis=1)
+        per_row = np.minimum(e_direct, e_swap)
+        print("\n--- K projection sanity: XK at step 0 must equal K[py, :] (no shift yet) ---")
+        print("  per-row max|XK(step0) - K|:", np.round(per_row, 4))
+        print("  offset_step(py)          :", [offset_step_of(py) for py in range(P)])
+        bad_rows = [py for py in range(P) if per_row[py] > 5e-2]
+        print(f"  rows with a BROKEN K projection: {bad_rows}")
+        if bad_rows:
+            odd_off = [py for py in range(P) if offset_step_of(py) % 2 == 1]
+            print(f"  rows with ODD offset_step (odd X pre-shift hop count): {odd_off}")
+            if sorted(bad_rows) == sorted(odd_off):
+                print("  => CONFIRMED: the K projection is wrong exactly for rows needing an ODD")
+                print("     pre-shift hop count. The bug is in xk_matmul / left_matrix_shift,")
+                print("     NOT in the score matmul or its reduce.")
+        else:
+            print("  => K projection is CLEAN; the corruption really does start in the shift.")
+
         # Is an odd (mixed) step per-column DRIFT (each column holds some *valid* K row,
         # so the PEs are out of lockstep) or GARBAGE (values match no K row, so we are
         # reading a buffer mid-write)? The residual separates the two.
@@ -398,12 +423,13 @@ def main():
                     if (offset_step_of(py) + s) % P % 2 == 0]
         print(f"\n  residual on even-co steps: max={max(even_res):.4g} mean={np.mean(even_res):.4g}")
         print(f"  residual on odd-co  steps: max={max(odd_res):.4g} mean={np.mean(odd_res):.4g}")
+        # NB: a mean residual ~ (K value range)/(number of K entries) is what RANDOM values
+        # score against this table, so a nonzero odd-step residual only says "not a real K
+        # row" -- it does NOT distinguish drift from tearing. Trust the step-0 check above.
         if max(odd_res) < 1e-2:
-            print("  => odd-step values ARE real K rows, just different ones per column:")
-            print("     the PEs are OUT OF LOCKSTEP (drift), not reading torn buffers.")
+            print("  => odd-step values ARE real K rows, just different ones per column.")
         else:
-            print("  => odd-step values match no K row: buffers are read MID-WRITE (torn),")
-            print("     i.e. the compute races the async recv rather than drifting a step.")
+            print("  => odd-step values match no real K row (consistent with random data).")
 
         mixed = int((seen < 0).sum())
         misaligned = int(((seen >= 0) & (seen != want)).sum())
@@ -418,8 +444,9 @@ def main():
                             if (offset_step_of(py) + s) % P % 2 == 0)
             print(f"  all odd-co steps mixed: {bad_odd};  all even-co steps clean: {good_even}")
             if bad_odd and good_even:
-                print("  => CONFIRMED: the XK two-hop shift delivers a settled key only on even co.")
-                print("     The reduce is innocent; mm_two_hop_comm_T / its rendezvous is the bug.")
+                print("  => a row is clean exactly when co is even, i.e. exactly when it currently")
+                print("     holds one of the keys whose projection survived -- see the step-0 check")
+                print("     above for whether the shift or the projection is at fault.")
         elif misaligned:
             print("  => XK delivery is CLEAN; the key->column mapping f(co) is what's wrong.")
         else:
