@@ -235,7 +235,8 @@ def main():
     # Pre-fetch all symbol handles right after run() (the launch_sim.py ordering).
     names = ["X", "W", "W2", "Q_weight", "K_weight", "V_weight", "O_weight",
              "freqs_sin", "freqs_cos", "UP_weight", "GATE_weight", "DOWN_weight",
-             "Z", "Z_mid", "score_dbg", "xk_trace", "probs_dbg", "xv_dbg"]
+             "Z", "Z_mid", "score_dbg", "xk_trace", "probs_dbg", "xv_dbg",
+             "output_dbg", "h1_dbg"]
     syms = {}
     for nm in names:
         syms[nm] = runner.get_id(nm)
@@ -283,6 +284,8 @@ def main():
         xk_trace_1d = d2h("xk_trace", P * seq_len_p_pe * head_dim_p_pe)
         probs_dbg_1d = d2h("probs_dbg", seq_len_p_pe * seq_len_p_pe)
         xv_dbg_1d = d2h("xv_dbg", seq_len_p_pe * head_dim_p_pe)
+        output_dbg_1d = d2h("output_dbg", seq_len_p_pe * head_dim_p_pe)
+        h1_dbg_1d = d2h("h1_dbg", seq_len_p_pe * dim_p_pe)
         Zfull_1d = d2h("Z", seq_len_p_pe * dim_p_pe)
         Zfull = untile_flat_1d(Zfull_1d, P, seq_len_p_pe, dim_p_pe) if Zfull_1d is not None else None
     finally:
@@ -312,6 +315,9 @@ def main():
         if h == 0:
             probs_h0 = Pr.copy()
         Oh = Pr @ Vg
+        if h == 0:
+            Oh_h0 = Oh.copy()
+            h1_h0 = Oh @ Wo[h * head_dim:(h + 1) * head_dim, :].astype(np.float32)
         attn += Oh @ Wo[h * head_dim:(h + 1) * head_dim, :].astype(np.float32)
     Zmid_oracle = Xf + attn
 
@@ -371,6 +377,26 @@ def main():
             print("  per-row max|XV - V|:", np.round(np.minimum(e_direct, e_swap), 4))
             print("  offset_step(py)    :", [0 if py == 0 else (P - py // 2 if py % 2 == 0
                                              else (py + 1) // 2) for py in range(P)])
+
+    # ---- the last three stages: output_matmul, h1_matmul (O-proj), z_add ----
+    # probs and XV are validated, so if output_h is wrong the fault is output_matmul;
+    # if output_h is right but h1 is wrong it is the O-proj; if both are right the fault
+    # is z_add or the cross-head accumulation into h1.
+    if seq_len_p_pe == 1 and head_dim_p_pe == 1 and output_dbg_1d is not None:
+        out_k = output_dbg_1d.reshape(P, P).astype(np.float64)       # [py=query, px=dim]
+        print("\n--- head-0 output_h = probs @ XV (input to the O-proj) ---")
+        report("output_h", out_k, Oh_h0.astype(np.float64))
+        e_direct = np.abs(out_k - Oh_h0).max(axis=1)
+        e_swap = np.abs(out_k - Oh_h0[:, sw_v]).max(axis=1)
+        print("  per-row max|output_h - Oh|:", np.round(np.minimum(e_direct, e_swap), 4))
+
+    if seq_len_p_pe == 1 and h1_dbg_1d is not None:
+        h1_k = untile_flat_1d(h1_dbg_1d, P, seq_len_p_pe, dim_p_pe)  # [seq, dim]
+        print("\n--- h1 after head-0 O-proj only (head 0's contribution to attn) ---")
+        report("h1(head0)", h1_k.astype(np.float64), h1_h0.astype(np.float64))
+        print("  per-row max|h1 - Oh@Wo_h0|:",
+              np.round(np.abs(h1_k.astype(np.float64) - h1_h0).max(axis=1), 4))
+        print(f"  |h1_kernel|={np.linalg.norm(h1_k):.4f}  |h1_oracle|={np.linalg.norm(h1_h0):.4f}")
 
     # ---- XK delivery trace: does every column hold the SAME key at each step? ----
     # The reduce sums partials across px, which is only meaningful if all columns in a

@@ -283,6 +283,8 @@ layout {
     @export_name("xk_trace", [*]f16, true);
     @export_name("probs_dbg", [*]f16, true);
     @export_name("xv_dbg", [*]f16, true);
+    @export_name("output_dbg", [*]f16, true);
+    @export_name("h1_dbg", [*]f16, true);
     // wyn: end
 
     @export_name("init_task", fn()void);
