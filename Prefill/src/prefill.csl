@@ -383,10 +383,29 @@ fn matmul_T_reduce_add() void {
         reduce_root = 2 * (P - current_offset);
     }
 
-    comm_mod.matmul_T_reduce_add_x(reduce_root, ptr_seqLen_seqLen_tmp, ptr_score);
-    
-    @load_to_dsr(comp_dest_dsr_1, seqLen_seqLen_tmp_dsd);
-    @fmovh(comp_dest_dsr_1, 0.0);
+    // wyn: matmul_T_reduce_add_x gathers toward a *variable* root, so PEs flip send
+    // direction between consecutive steps on the shared c_right/c_left queues. Verified
+    // on the P=8 sim: the sum is only correct on alternate steps (even co bit-exact,
+    // odd co garbage). reduce_root above is still the right destination -- only the sum
+    // is broken -- so take the sum from the fixed-root all-reduce (same primitive
+    // rmsnorm/softmax use) and select the destination locally. f(co) is a bijection, so
+    // each column stores exactly once => score row in natural key order for the mask.
+    // Guarded on seq_len_p_pe==1: mv_allreduce_add_x carries seq_len_p_pe elements but
+    // the score tile is seq_len_p_pe^2; they coincide only at 1 (the P=128 regime).
+    if (seq_len_p_pe == 1) {
+        comm_mod.mv_allreduce_add_x(ptr_seqLen_seqLen_tmp);
+
+        if (px == reduce_root) {
+            ptr_score[0] = ptr_seqLen_seqLen_tmp[0];
+        }
+
+        ptr_seqLen_seqLen_tmp[0] = 0.0;
+    } else {
+        comm_mod.matmul_T_reduce_add_x(reduce_root, ptr_seqLen_seqLen_tmp, ptr_score);
+
+        @load_to_dsr(comp_dest_dsr_1, seqLen_seqLen_tmp_dsd);
+        @fmovh(comp_dest_dsr_1, 0.0);
+    }
 }
 
 fn matmul_T_compute() void {
