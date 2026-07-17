@@ -378,6 +378,33 @@ def main():
         print(f"(worst nearest-value match residual: {worst:.4g} -- large means the")
         print(" identification itself is unreliable, not the alignment)")
 
+        # Is an odd (mixed) step per-column DRIFT (each column holds some *valid* K row,
+        # so the PEs are out of lockstep) or GARBAGE (values match no K row, so we are
+        # reading a buffer mid-write)? The residual separates the two.
+        print("\nper-column detail for py=0 (key@residual; residual >> 0 => not a real K row):")
+        for s in range(P):
+            co = (offset_step_of(0) + s) % P
+            cells = []
+            for px in range(P):
+                k, e = which_key(xk[0, px, s])
+                cells.append(f"{k}@{e:.3f}")
+            print(f"  step {s} (co={co},{'even' if co % 2 == 0 else 'odd '}): " + "  ".join(cells))
+
+        odd_res = [which_key(xk[py, px, s])[1]
+                   for py in range(P) for s in range(P) for px in range(P)
+                   if (offset_step_of(py) + s) % P % 2 == 1]
+        even_res = [which_key(xk[py, px, s])[1]
+                    for py in range(P) for s in range(P) for px in range(P)
+                    if (offset_step_of(py) + s) % P % 2 == 0]
+        print(f"\n  residual on even-co steps: max={max(even_res):.4g} mean={np.mean(even_res):.4g}")
+        print(f"  residual on odd-co  steps: max={max(odd_res):.4g} mean={np.mean(odd_res):.4g}")
+        if max(odd_res) < 1e-2:
+            print("  => odd-step values ARE real K rows, just different ones per column:")
+            print("     the PEs are OUT OF LOCKSTEP (drift), not reading torn buffers.")
+        else:
+            print("  => odd-step values match no K row: buffers are read MID-WRITE (torn),")
+            print("     i.e. the compute races the async recv rather than drifting a step.")
+
         mixed = int((seen < 0).sum())
         misaligned = int(((seen >= 0) & (seen != want)).sum())
         print(f"\n  steps where columns disagree on the key: {mixed}/{P*P}")
