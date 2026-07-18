@@ -1,0 +1,9 @@
+{
+    "P": 16,
+    "dim": 256,
+    "n_heads": 16,
+    "n_kv_heads": 4,
+    "head_dim": 16,
+    "seq_len": 16,
+    "ffn_dim": 256
+}
