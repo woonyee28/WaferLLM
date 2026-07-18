@@ -91,6 +91,9 @@ class Config:
 def parse_args():
     parser = argparse.ArgumentParser(description="Attention validation on simulator")
     parser.add_argument("--config", default="config.json", type=str)
+    parser.add_argument("--rope", action="store_true",
+                        help="enable REAL RoPE (theta=500000 + rope_perm), matching the device. "
+                             "Default off (cos=1/sin=0) to isolate the matmul path.")
     args = parser.parse_args()
     return args
 
@@ -199,8 +202,27 @@ def main():
                     out[i, j, off:off + head_dim_p_pe * dim_p_pe] = blk.reshape(-1)
         return out
 
-    q_hm = shard_qkv_headmajor(Wq, n_heads)
-    k_hm = shard_qkv_headmajor(Wk, n_kv_heads)
+    # wyn: REAL RoPE test. The kernel rotates ADJACENT pairs (2i,2i+1); HF rotate-half pairs
+    # (i, i+D/2). The host permutes q/k output columns per head so kernel col 2i <- HF col i+D/2
+    # and col 2i+1 <- HF col i, which makes the kernel's adjacent rope reproduce HF exactly.
+    # Copied verbatim from launch_device.py:rope_perm. The kernel gets permuted Wq/Wk; the ORACLE
+    # keeps the original Wq/Wk and applies standard HF rope -> an independent end-to-end check.
+    def rope_perm(w, D, n):
+        half = D // 2
+        p = np.empty(D, dtype=np.int64)
+        p[0::2] = np.arange(half) + half   # even kernel cols <- HF second half x[i+D/2]
+        p[1::2] = np.arange(half)          # odd  kernel cols <- HF first half  x[i]
+        full = np.concatenate([h * D + p for h in range(n)])
+        return w[:, full]
+
+    if args.rope:
+        Wq_k = rope_perm(Wq, head_dim, n_heads)
+        Wk_k = rope_perm(Wk, head_dim, n_kv_heads)
+    else:
+        Wq_k, Wk_k = Wq, Wk
+
+    q_hm = shard_qkv_headmajor(Wq_k, n_heads)
+    k_hm = shard_qkv_headmajor(Wk_k, n_kv_heads)
     v_hm = shard_qkv_headmajor(Wv, n_kv_heads)
     o_hm = shard_o_headmajor(Wo, n_heads)
 
@@ -218,9 +240,24 @@ def main():
             down_sh[i * ffn_dim_p_pe:(i + 1) * ffn_dim_p_pe, j * dim_p_pe:(j + 1) * dim_p_pe] = \
                 Wdown[t * ffn_dim_p_pe:(t + 1) * ffn_dim_p_pe, j * dim_p_pe:(j + 1) * dim_p_pe]
 
-    # RoPE OFF: cos=1, sin=0 (kernel rope becomes a pair-swap, cancels in the score)
-    tensor_freqs_cos = np.ones((P, P, _dim_p_pe // 2), dtype=np.float16)
-    tensor_freqs_sin = np.zeros((P, P, _dim_p_pe // 2), dtype=np.float16)
+    if args.rope:
+        # REAL RoPE freq tables (theta=500000). Verbatim from launch_device.py; this test
+        # targets the head_dim_p_pe==1 regime (rope_nn nearest-neighbour path, as on P=128).
+        theta = 500000.0
+        npairs = _dim_p_pe // 2
+        tensor_freqs_cos = np.zeros((P, P, npairs), dtype=np.float16)
+        tensor_freqs_sin = np.zeros((P, P, npairs), dtype=np.float16)
+        assert head_dim_p_pe == 1, "this rope sim targets head_dim_p_pe==1 (set head_dim==P)"
+        for py in range(P):
+            for px in range(P):
+                i = px // 2                                  # shared within-head pair index
+                angle = py * (theta ** (-2.0 * i / head_dim))
+                tensor_freqs_cos[py, px, 0] = np.cos(angle)
+                tensor_freqs_sin[py, px, 0] = np.sin(angle)
+    else:
+        # RoPE OFF: cos=1, sin=0 (kernel rope becomes a pair-swap, cancels in the score)
+        tensor_freqs_cos = np.ones((P, P, _dim_p_pe // 2), dtype=np.float16)
+        tensor_freqs_sin = np.zeros((P, P, _dim_p_pe // 2), dtype=np.float16)
 
     # ============================ run on sim ============================
     cfg_name = os.path.splitext(os.path.basename(args.config))[0]
@@ -297,11 +334,30 @@ def main():
     Xn = Xf / np.sqrt(ms + eps)                           # W = ones
     attn = np.zeros((seq_len, dim), dtype=np.float32)
     causal = np.triu(np.ones((seq_len, seq_len), dtype=bool), k=1)  # True where key>query
+
+    # HF rotate-half RoPE oracle (theta=500000). x_embed[i]=x[i]cos - x[i+D/2]sin;
+    # x_embed[i+D/2]=x[i+D/2]cos + x[i]sin, angle = pos * theta^(-2i/D). Applied to Q and K
+    # (unpermuted); the kernel reaches the SAME result via rope_perm + adjacent-pair rope.
+    def rope_hf(xh):                                       # xh: [seq, head_dim]
+        if not args.rope:
+            return xh
+        D = head_dim; half = D // 2
+        i = np.arange(half)
+        inv = theta ** (-2.0 * i / D)                     # [half]
+        pos = np.arange(xh.shape[0])[:, None]             # [seq,1]
+        ang = pos * inv[None, :]                          # [seq, half]
+        c, s = np.cos(ang), np.sin(ang)
+        lo, hi = xh[:, :half], xh[:, half:]
+        out = np.empty_like(xh)
+        out[:, :half] = lo * c - hi * s
+        out[:, half:] = hi * c + lo * s
+        return out
+
     raw_score_h0 = None
     for h in range(n_heads):
         g = h // group
-        Qh = Xn @ Wq[:, h * head_dim:(h + 1) * head_dim].astype(np.float32)
-        Kg = Xn @ Wk[:, g * head_dim:(g + 1) * head_dim].astype(np.float32)
+        Qh = rope_hf(Xn @ Wq[:, h * head_dim:(h + 1) * head_dim].astype(np.float32))
+        Kg = rope_hf(Xn @ Wk[:, g * head_dim:(g + 1) * head_dim].astype(np.float32))
         Vg = Xn @ Wv[:, g * head_dim:(g + 1) * head_dim].astype(np.float32)
         raw = Qh @ Kg.T
         if h == 0:
@@ -507,7 +563,9 @@ def main():
     # this is robust to any column permutation the rope/sharding may introduce.
     if seq_len_p_pe == 1 and head_dim_p_pe == 1 and xk_trace_1d is not None:
         xk = xk_trace_1d.reshape(P, P, P).astype(np.float64)          # [py, px, step]
-        Kg0 = (Xn @ Wk[:, 0:head_dim].astype(np.float32)).astype(np.float64)   # [key, head_dim]
+        # xk_trace is captured in the SCORE matmul, i.e. POST-rope, so the reference K must be
+        # roped too when --rope is on (else this falsely flags every row as broken).
+        Kg0 = rope_hf(Xn @ Wk[:, 0:head_dim].astype(np.float32)).astype(np.float64)  # [key, head_dim]
         flat = Kg0.ravel()                                            # idx = key*head_dim + d
 
         def which_key(v):
