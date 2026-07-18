@@ -501,8 +501,35 @@ def main():
         ref = np.load(os.path.join(resid_dir, ref_path)).astype(np.float32)
         report_match(name, got_full[:ref.shape[0]], ref)
 
+    # wyn: CONTRIBUTION cosine -- the honest metric. resid_mid / resid_post are a small
+    # correction riding on a large passthrough (resid_pre / resid_mid), so the full cosine
+    # in report_match is dominated by the passthrough and reads ~0.95-0.99 even when the
+    # correction is near-orthogonal. On the P=8 sim the full metric read 0.95 while attention
+    # was 0.16, and 0.986 while the FFN was 0.367. Strip the passthrough and compare only the
+    # block's own contribution. (ref_base = the layer input each stage rides on.)
+    def report_contrib(name, got_full, ref_path, base):
+        ref = np.load(os.path.join(resid_dir, ref_path)).astype(np.float64)
+        b = base.astype(np.float64)[:ref.shape[0]]
+        g = got_full.astype(np.float64)[:ref.shape[0]] - b
+        r = ref - b
+        gf, rf = g.ravel(), r.ravel()
+        cos = float(np.dot(gf, rf) / (np.linalg.norm(gf) * np.linalg.norm(rf) + 1e-30))
+        ok = cos >= 0.999
+        print(f"[CONTRIB {name}] cos={cos:.6f}  |kernel|={np.linalg.norm(gf):.4f}  "
+              f"|ref|={np.linalg.norm(rf):.4f}  -> {'PASS' if ok else 'FAIL'}")
+        return ok
+
+    resid_pre_f = np.zeros((seq_len, dim), dtype=np.float32)
+    resid_pre_f[:n_tok] = resid_pre.astype(np.float32)
+    resid_mid_ref = np.load(os.path.join(resid_dir, "resid_mid_block0.npy")).astype(np.float32)
+
     report("resid_mid", Zmid_layer0, "resid_mid_block0.npy")
+    report_contrib("attn (resid_mid - resid_pre)", Zmid_layer0, "resid_mid_block0.npy", resid_pre_f)
     report("resid_post", Z_layer0, "resid_post_block0.npy")
+    # FFN contribution rides on resid_mid; only meaningful on a real-ffn_dim (non-truncated) build.
+    report_contrib("ffn (resid_post - resid_mid)", Z_layer0, "resid_post_block0.npy",
+                   resid_mid_ref[:seq_len] if resid_mid_ref.shape[0] >= seq_len
+                   else np.pad(resid_mid_ref, ((0, seq_len - resid_mid_ref.shape[0]), (0, 0))))
     np.save("csl_layer0_output.npy", Z_layer0)
     np.save("csl_layer0_resid_mid.npy", Zmid_layer0)
     # wyn: end

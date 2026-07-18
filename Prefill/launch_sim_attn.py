@@ -409,8 +409,10 @@ def main():
                 print("  => CONFIRMED: z2_matmul has the SAME buffer-parity bug xk_matmul had.")
                 print("     Fix identically: swap into recv rather than naming Z_norm_tile.")
             elif min(np.mean(ev), np.mean(od)) > 0.99:
-                print("  => FFN is clean per-row: NO buffer-parity bug. Any remaining gap is")
-                print("     fp16 accumulation, and the 0.986 device figure is honest.")
+                print("  => FFN clean per-row, both parities: the z2_matmul buffer-parity fix holds.")
+                print("     NB: the pre-fix aggregate was 0.9859 at ffn_dim=32, where fp16")
+                print("     accumulation is negligible -- so the device's 0.986 was THIS BUG,")
+                print("     not accumulation. Do not resurrect that explanation.")
             else:
                 print("  => FFN error does NOT split by offset_step parity -- a different bug.")
 

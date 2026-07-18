@@ -228,6 +228,20 @@ def main():
     # compute the right function?) and report max relative error on significant elements for context.
     resid_post = np.load(os.path.join(resid_dir, "resid_post_block0.npy")).astype(np.float32)
     report_match("resid_post", Z_layer0[:resid_post.shape[0]], resid_post)
+
+    # wyn: CONTRIBUTION cosine -- the honest metric. Z_layer0 = resid_mid + mlp(...), so the full
+    # cosine above rides on the resid_mid passthrough and hides FFN error: on the P=8 sim it read
+    # 0.986 while the FFN contribution was 0.367 (a buffer-parity bug in z2_matmul, now fixed).
+    # Strip the passthrough: compare (Z - resid_mid) against (resid_post - resid_mid).
+    n = resid_post.shape[0]
+    base = resid_mid.astype(np.float64)[:n]
+    g = Z_layer0.astype(np.float64)[:n] - base
+    r = resid_post.astype(np.float64)[:n] - base
+    gf, rf = g.ravel(), r.ravel()
+    cos_c = float(np.dot(gf, rf) / (np.linalg.norm(gf) * np.linalg.norm(rf) + 1e-30))
+    print(f"[CONTRIB ffn (resid_post - resid_mid)] cos={cos_c:.6f}  "
+          f"|kernel|={np.linalg.norm(gf):.4f}  |ref|={np.linalg.norm(rf):.4f}  "
+          f"-> {'PASS' if cos_c >= 0.999 else 'FAIL'}")
     np.save("csl_ffn_output.npy", Z_layer0)
 
 if __name__ == "__main__":
