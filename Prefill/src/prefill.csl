@@ -168,7 +168,13 @@ var ptr_W2: [*]f16 = &W2_tile;
 // wyn: end
 
 // * Q_weight, K_weight, V_weight: QKV weights input
-var Q_weight_tile: [dim_p_pe * dim_p_pe]f16 = @zeros([dim_p_pe * dim_p_pe]f16);
+// wyn: BUG FIX (13 Jul sim). Was [dim_p_pe * dim_p_pe] -- correct ONLY when
+// dim_p_pe == n_heads*head_dim_p_pe (true for the single-head original and the P=128 device,
+// so both were unaffected). For any config with more heads than that (dim_p_pe < n_heads*
+// head_dim_p_pe), head h>=... reads PAST the buffer: at P=8/dim=32/n_heads=8 the buffer held
+// 16 elems but head 4 starts at offset 16 -> heads 4-7 projected garbage Q. The Q weights hold
+// n_heads slices of dim_p_pe*head_dim_p_pe each. Size accordingly. (O_weight has the same fix.)
+var Q_weight_tile: [n_heads * dim_p_pe * head_dim_p_pe]f16 = @zeros([n_heads * dim_p_pe * head_dim_p_pe]f16);
 var ptr_Q_weight: [*]f16 = &Q_weight_tile;
 
 // wyn: rectangular K/V weights — hold n_kv_heads head-slices of [dim_p_pe*head_dim_p_pe]
@@ -186,7 +192,9 @@ var ptr_freqs_sin: [*]f16 = &freqs_sin;
 var freqs_cos: [_dim_p_pe / 2]f16 = @zeros([_dim_p_pe / 2]f16);
 var ptr_freqs_cos: [*]f16 = &freqs_cos;
 
-var O_weight_tile: [dim_p_pe * dim_p_pe]f16 = @zeros([dim_p_pe * dim_p_pe]f16);
+// wyn: BUG FIX (13 Jul sim) -- same undersize as Q_weight_tile (see its note). O weights hold
+// n_heads slices of head_dim_p_pe*dim_p_pe each. No-op on device / single-head (sizes coincide).
+var O_weight_tile: [n_heads * head_dim_p_pe * dim_p_pe]f16 = @zeros([n_heads * head_dim_p_pe * dim_p_pe]f16);
 var ptr_O_weight: [*]f16 = &O_weight_tile;
 
 var UP_weight_tile: [dim_p_pe * ffn_dim_p_pe]f16 = @zeros([dim_p_pe * ffn_dim_p_pe]f16);
