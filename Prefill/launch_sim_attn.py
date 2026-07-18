@@ -273,7 +273,7 @@ def main():
     names = ["X", "W", "W2", "Q_weight", "K_weight", "V_weight", "O_weight",
              "freqs_sin", "freqs_cos", "UP_weight", "GATE_weight", "DOWN_weight",
              "Z", "Z_mid", "score_dbg", "xk_trace", "probs_dbg", "xv_dbg",
-             "output_dbg", "h1_dbg"]
+             "output_dbg", "h1_dbg", "h1_per_head"]
     syms = {}
     for nm in names:
         syms[nm] = runner.get_id(nm)
@@ -323,6 +323,7 @@ def main():
         xv_dbg_1d = d2h("xv_dbg", seq_len_p_pe * head_dim_p_pe)
         output_dbg_1d = d2h("output_dbg", seq_len_p_pe * head_dim_p_pe)
         h1_dbg_1d = d2h("h1_dbg", seq_len_p_pe * dim_p_pe)
+        h1_per_head_1d = d2h("h1_per_head", n_heads * seq_len_p_pe * dim_p_pe)
         Zfull_1d = d2h("Z", seq_len_p_pe * dim_p_pe)
         Zfull = untile_flat_1d(Zfull_1d, P, seq_len_p_pe, dim_p_pe) if Zfull_1d is not None else None
     finally:
@@ -354,6 +355,7 @@ def main():
         return out
 
     raw_score_h0 = None
+    per_head_oracle = []
     for h in range(n_heads):
         g = h // group
         Qh = rope_hf(Xn @ Wq[:, h * head_dim:(h + 1) * head_dim].astype(np.float32))
@@ -374,7 +376,9 @@ def main():
         if h == 0:
             Oh_h0 = Oh.copy()
             h1_h0 = Oh @ Wo[h * head_dim:(h + 1) * head_dim, :].astype(np.float32)
-        attn += Oh @ Wo[h * head_dim:(h + 1) * head_dim, :].astype(np.float32)
+        head_contrib = Oh @ Wo[h * head_dim:(h + 1) * head_dim, :].astype(np.float32)
+        per_head_oracle.append(head_contrib.copy())   # this head's O-proj contribution to attn
+        attn += head_contrib
     Zmid_oracle = Xf + attn
 
     # ============================ compare ============================
@@ -554,6 +558,32 @@ def main():
             print("\n--- cross-check: h1 should equal (kernel's own output_h) @ Wo_h0 ---")
             report("h1 from kernel output_h", h1_k.astype(np.float64), h1_pred)
             print("  PASS => O-proj correct, only inherits output_matmul's error.")
+
+    # ---- PER-HEAD decomposition: which head diverges? (head 0 clean but sum wrong at group=4) ----
+    # h1_per_head[k] = cumulative h1 through head k. Head k's own contribution = cum[k]-cum[k-1].
+    # Compare each to the numpy oracle's per-head O-proj contribution -> pinpoints the bad head,
+    # and (via kv_head_idx = k // group) whether it tracks the KV-head boundary.
+    if h1_per_head_1d is not None:
+        S = seq_len_p_pe * dim_p_pe
+        hph = h1_per_head_1d.reshape(P, P, n_heads, S)
+        cum = [untile_flat_1d(hph[:, :, k, :].reshape(-1), P, seq_len_p_pe, dim_p_pe).astype(np.float64)
+               for k in range(n_heads)]
+        print("\n--- PER-HEAD attention contribution (kernel vs oracle) ---")
+        print("  head | kv_head=h//group | row cosine | max_abs_err | |kernel| | |oracle|")
+        for k in range(n_heads):
+            contrib_k = cum[k] - (cum[k - 1] if k > 0 else 0.0)
+            ref_k = per_head_oracle[k].astype(np.float64)
+            gf, rf = contrib_k.ravel(), ref_k.ravel()
+            cos = float(np.dot(gf, rf) / (np.linalg.norm(gf) * np.linalg.norm(rf) + 1e-30))
+            flag = "" if cos >= 0.999 else "   <-- BAD"
+            print(f"   {k:3d} |        {k // group:2d}        |  {cos:8.5f}  |  {np.abs(gf-rf).max():9.4f}  |"
+                  f" {np.linalg.norm(gf):7.3f} | {np.linalg.norm(rf):7.3f}{flag}")
+        bad = [k for k in range(n_heads)
+               if float(np.dot((cum[k]-(cum[k-1] if k>0 else 0.0)).ravel(), per_head_oracle[k].ravel().astype(np.float64)) /
+                        (np.linalg.norm((cum[k]-(cum[k-1] if k>0 else 0.0)).ravel())*np.linalg.norm(per_head_oracle[k].ravel())+1e-30)) < 0.999]
+        print(f"  bad heads: {bad}")
+        if bad:
+            print(f"  bad kv_head boundaries: heads map to kv = {[k // group for k in bad]}")
 
     # ---- XK delivery trace: does every column hold the SAME key at each step? ----
     # The reduce sums partials across px, which is only meaningful if all columns in a

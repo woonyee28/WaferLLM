@@ -300,6 +300,13 @@ var ptr_output_dbg: [*]f16 = &output_dbg;
 var h1_dbg: [seq_len_p_pe * dim_p_pe]f16 = @zeros([seq_len_p_pe * dim_p_pe]f16);
 var ptr_h1_dbg: [*]f16 = &h1_dbg;
 
+// wyn: DEBUG per-head cumulative h1 snapshot -- h1 after EACH head's O-proj accumulate,
+// indexed by head_idx (n_heads <= P). The host diffs consecutive heads to get each head's
+// contribution and compares to the numpy oracle -> localizes WHICH head diverges (head 0 is
+// clean at group=4 but the all-heads sum fails, so the bug is a later head / the KV sharing).
+var h1_per_head: [P * seq_len_p_pe * dim_p_pe]f16 = @zeros([P * seq_len_p_pe * dim_p_pe]f16);
+var ptr_h1_per_head: [*]f16 = &h1_per_head;
+
 var h1_tile: [seq_len_p_pe * dim_p_pe]f16 = @zeros([seq_len_p_pe * dim_p_pe]f16);
 var ptr_h1: [*]f16 = &h1_tile;
 var h1_dsd = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{seq_len_p_pe * dim_p_pe} -> h1_tile[i] });
@@ -1318,6 +1325,10 @@ fn prefill_struct() void {
                 h1_dbg[i] = h1_tile[i];
             }
         }
+        // wyn: DEBUG snapshot cumulative h1 for THIS head into the per-head buffer.
+        for (@range(i16, seq_len_p_pe * dim_p_pe)) |i| {
+            h1_per_head[head_idx * seq_len_p_pe * dim_p_pe + i] = h1_tile[i];
+        }
         if (head_idx < n_heads - 1) {
             head_idx += 1;
             kv_head_idx = head_idx / group;
@@ -1467,6 +1478,7 @@ comptime {
     @export_symbol(ptr_xv_dbg, "xv_dbg");         // wyn: DEBUG head-0 XV as output_matmul sees it
     @export_symbol(ptr_output_dbg, "output_dbg"); // wyn: DEBUG head-0 probs@XV
     @export_symbol(ptr_h1_dbg, "h1_dbg");         // wyn: DEBUG h1 after head-0 O-proj only
+    @export_symbol(ptr_h1_per_head, "h1_per_head"); // wyn: DEBUG per-head cumulative h1
     // wyn: end
     @export_symbol(init_task);
     @export_symbol(prefill_host);
