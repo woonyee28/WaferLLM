@@ -330,6 +330,18 @@ var left_matrix_dsd = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{1} -> dummy[i]
 var right_matrix_dsd = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{1} -> dummy[i] });
 var out_matrix_dsd = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{1} -> dummy[i] });
 
+// wyn: fp32 accumulation for the FFN matmuls (z1/z2/h2). @fmach accumulates in f16; over the
+// 14336-wide down-projection that rounds the running sum ~14k times and costs ~4.5% of the output
+// magnitude. @fmachs keeps the sum in f32 with f16 multiplicands -- the PE's native "16-bit
+// multiply, 32-bit add" mixed-precision FMAC (no operand widening). We accumulate into acc_f32_tile
+// and cast ONCE back to the f16 output tile when the contraction finishes, so every downstream
+// stage stays f16 and attention is unaffected. Sized to the largest FFN output (seq x ffn_dim).
+var acc_f32_tile: [seq_len_p_pe * ffn_dim_p_pe]f32 = @zeros([seq_len_p_pe * ffn_dim_p_pe]f32);
+var ptr_acc_f32: [*]f32 = &acc_f32_tile;
+var acc_f32_dsd = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{seq_len_p_pe * ffn_dim_p_pe} -> acc_f32_tile[i] });   // clear + cast
+var out_matrix_f32_dsd = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{1} -> acc_f32_tile[i] });                      // per-step accumulate (mirrors out_matrix_dsd)
+var accum_f32: bool = false;   // set by the FFN matmuls; matmul_compute reads it
+
 var seqLen_dsd_1 = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{seq_len_p_pe} -> dummy[i] });
 var seqLen_dsd_2 = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{seq_len_p_pe} -> dummy[i] });
 
@@ -432,6 +444,18 @@ fn matmul_map_func(curR: f16) void {
     @fmach(comp_dest_dsr_1, comp_src0_dsr_1, comp_src1_dsr_1, curR);
 }
 
+// wyn: fp32-accumulate variant -- f32 dest/accumulator (comp_dest/comp_src0), f16 multiplicands
+// (comp_src1 = left, curR = right). Same op as matmul_map_func, in the PE's mixed-precision mode.
+fn matmul_map_func_f32(curR: f16) void {
+    @fmachs(comp_dest_dsr_1, comp_src0_dsr_1, comp_src1_dsr_1, curR);
+}
+
+// wyn: down-cast one f32 accumulator element to f16 (used once per FFN matmul, at the finish, to
+// write the completed f32 sum back into the f16 output tile).
+fn cast_f32_to_f16(x: f32) f16 {
+    return @as(f16, x);
+}
+
 fn matmul_T_reduce_add() void {
 
     current_offset = @as(i16, math_lib.floor_f16(@as(f16, (offset_step + step - 1)) / @as(f16, P)));
@@ -514,14 +538,26 @@ fn matmul_compute() void {
         left_matrix_dsd = @set_dsd_base_addr(left_matrix_dsd, ptr_left_matrix_send);
         right_matrix_dsd = @set_dsd_base_addr(right_matrix_dsd, ptr_right_matrix_send);
 
+        // wyn: FFN matmuls accumulate into the f32 tile (same [Mt x Nt] layout as the f16 output).
+        if (accum_f32) {
+            out_matrix_f32_dsd = @set_dsd_length(out_matrix_f32_dsd, @bitcast(u16, Mt));
+        }
+
         for (@range(i16, Kt)) |k| {
 
-            out_matrix_dsd = @set_dsd_base_addr(out_matrix_dsd, ptr_out_matrix);
-
-            @load_to_dsr(comp_dest_dsr_1, out_matrix_dsd, .{ .save_address = true });
-            @load_to_dsr(comp_src0_dsr_1, out_matrix_dsd, .{ .save_address = true });
-            @load_to_dsr(comp_src1_dsr_1, left_matrix_dsd, .{ .save_address = false });
-            @map(matmul_map_func, right_matrix_dsd);
+            if (accum_f32) {
+                out_matrix_f32_dsd = @set_dsd_base_addr(out_matrix_f32_dsd, ptr_acc_f32);
+                @load_to_dsr(comp_dest_dsr_1, out_matrix_f32_dsd, .{ .save_address = true });
+                @load_to_dsr(comp_src0_dsr_1, out_matrix_f32_dsd, .{ .save_address = true });
+                @load_to_dsr(comp_src1_dsr_1, left_matrix_dsd, .{ .save_address = false });
+                @map(matmul_map_func_f32, right_matrix_dsd);
+            } else {
+                out_matrix_dsd = @set_dsd_base_addr(out_matrix_dsd, ptr_out_matrix);
+                @load_to_dsr(comp_dest_dsr_1, out_matrix_dsd, .{ .save_address = true });
+                @load_to_dsr(comp_src0_dsr_1, out_matrix_dsd, .{ .save_address = true });
+                @load_to_dsr(comp_src1_dsr_1, left_matrix_dsd, .{ .save_address = false });
+                @map(matmul_map_func, right_matrix_dsd);
+            }
 
             left_matrix_dsd = @increment_dsd_offset(left_matrix_dsd, Mt, f16);
             right_matrix_dsd = @increment_dsd_offset(right_matrix_dsd, Nt, f16);
@@ -534,6 +570,20 @@ fn matmul_compute() void {
 
     } else {
         step = 0;
+
+        // wyn: contraction done -- cast the f32 accumulator back into the f16 output tile (a single
+        // rounding, after the whole sum), so every downstream FFN stage stays f16.
+        if (accum_f32) {
+            var cast_len: i16 = Mt * Nt;
+            out_matrix_dsd = @set_dsd_base_addr(out_matrix_dsd, ptr_out_matrix);
+            out_matrix_dsd = @set_dsd_length(out_matrix_dsd, @bitcast(u16, cast_len));
+            acc_f32_dsd = @set_dsd_length(acc_f32_dsd, @bitcast(u16, cast_len));
+            // wyn: @map convention is (func, INPUTS..., OUTPUT): x:f32 <- acc_f32_dsd, return
+            // f16 -> out_matrix_dsd. (Reversed order writes garbage into acc and leaves the f16
+            // output tile at zero -> |ffn_kernel|=0.)
+            @map(cast_f32_to_f16, acc_f32_dsd, out_matrix_dsd);   // out(f16) = (f16) acc(f32)
+            accum_f32 = false;
+        }
 
         prefill_struct();
     }
@@ -1075,9 +1125,12 @@ fn rmsnorm_z() void {
 
 fn z1_matmul() void {
 
-    // Clearing
-    @load_to_dsr(comp_dest_dsr_1, z1_dsd);
-    @fmovh(comp_dest_dsr_1, 0.0);
+    // wyn: fp32 accumulation (see acc_f32_tile). Clear the f32 accumulator, not z1_tile;
+    // matmul_compute casts the finished sum back into z1_tile.
+    accum_f32 = true;
+    acc_f32_dsd = @set_dsd_length(acc_f32_dsd, @bitcast(u16, seq_len_p_pe * ffn_dim_p_pe));
+    @load_to_dsr(comp_dest_dsr_1, acc_f32_dsd);
+    @fmovs(comp_dest_dsr_1, 0.0);
 
     ptr_left_matrix_send = &seqLen_dim_tmp;
     ptr_left_matrix_recv = &Z_norm_tile;
@@ -1108,9 +1161,11 @@ fn z1_matmul() void {
 
 fn z2_matmul() void {
 
-    // Clearing
-    @load_to_dsr(comp_dest_dsr_1, z2_dsd);
-    @fmovh(comp_dest_dsr_1, 0.0);
+    // wyn: fp32 accumulation (see acc_f32_tile). Clear the f32 accumulator; cast back to z2_tile.
+    accum_f32 = true;
+    acc_f32_dsd = @set_dsd_length(acc_f32_dsd, @bitcast(u16, seq_len_p_pe * ffn_dim_p_pe));
+    @load_to_dsr(comp_dest_dsr_1, acc_f32_dsd);
+    @fmovs(comp_dest_dsr_1, 0.0);
 
     // wyn: SAME BUG AS xk_matmul -- confirmed on the P=8 sim 13 Jul, and it was NOT the
     // "fp16 accumulation" the 0.986 was blamed on. This used to hardcode
@@ -1169,9 +1224,12 @@ fn z3_comp() void {
 
 fn h2_matmul() void {
 
-    // Clearing
-    @load_to_dsr(comp_dest_dsr_1, h2_dsd);
-    @fmovh(comp_dest_dsr_1, 0.0);
+    // wyn: fp32 accumulation -- this is the 14336-wide down-projection where f16 accumulation cost
+    // ~4.5%. Clear the f32 accumulator; matmul_compute casts the finished sum back into h2_tile.
+    accum_f32 = true;
+    acc_f32_dsd = @set_dsd_length(acc_f32_dsd, @bitcast(u16, seq_len_p_pe * ffn_dim_p_pe));
+    @load_to_dsr(comp_dest_dsr_1, acc_f32_dsd);
+    @fmovs(comp_dest_dsr_1, 0.0);
 
     ptr_left_matrix_send = &seqLen_ffnDim_tmp;
     ptr_left_matrix_recv = &z3_tile;
