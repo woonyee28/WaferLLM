@@ -106,7 +106,8 @@ def report(name, got, ref):
     denom = np.linalg.norm(g) * np.linalg.norm(r)
     cos = float(g @ r / denom) if denom > 0 else 0.0
     verdict = "PASS" if cos >= 0.999 else "FAIL"
-    print(f"[{name}] cos={cos:.6f}  max_abs={max_abs:.4e}  mean_abs={mean_abs:.4e}  -> {verdict}")
+    print(f"[{name}] cos={cos:.6f}  max_abs={max_abs:.4e}  mean_abs={mean_abs:.4e}  "
+          f"|kernel|={np.linalg.norm(g):.4f}  |oracle|={np.linalg.norm(r):.4f}  -> {verdict}")
     return cos
 
 
@@ -156,12 +157,14 @@ def main():
     Wgate = (rng.standard_normal((dim, ffn_dim)) * 0.1).astype(np.float16)
     Wdown = (rng.standard_normal((ffn_dim, dim)) * 0.1).astype(np.float16)
 
-    # RMSNorm weight = ONES for this run, so the (py-vs-px) W-tiling layout can't
-    # affect the result -> isolates the attention mechanics + head sharding + mask.
-    W = np.ones((1, dim), dtype=np.float16)
-    tensor_W = np.tile(W.reshape(P, dim_p_pe), reps=(1, P))
-    W2 = np.ones((1, dim), dtype=np.float16)
-    tensor_W2 = np.tile(W2.reshape(P, dim_p_pe), reps=(1, P))
+    # wyn: NON-UNIFORM RMSNorm weights now, to actually exercise the W-tiling (a wrong tiling was
+    # the P=128 device root cause; W=ones had masked it). Tiling FIX: each mesh row gets the FULL
+    # W; memcpy [py,px,d] then slices dim block px. (Was np.tile(W.reshape(P,dim_p_pe),(1,P)) which
+    # indexed W by py and scrambled it.) The oracle below multiplies by W / W2 to match.
+    W = (1.0 + 0.5 * rng.standard_normal((1, dim))).astype(np.float16)
+    tensor_W = np.tile(W.reshape(1, dim), reps=(P, 1))
+    W2 = (1.0 + 0.5 * rng.standard_normal((1, dim))).astype(np.float16)
+    tensor_W2 = np.tile(W2.reshape(1, dim), reps=(P, 1))
 
     # ----- ind permutation (same as launch_sim / launch_device) -----
     ind = np.zeros((P, P)).astype(int)
@@ -332,7 +335,7 @@ def main():
     # ============================ numpy oracle ============================
     Xf = X.astype(np.float32)
     ms = np.mean(Xf ** 2, axis=1, keepdims=True)          # sum(x^2)/dim
-    Xn = Xf / np.sqrt(ms + eps)                           # W = ones
+    Xn = (Xf / np.sqrt(ms + eps)) * W.astype(np.float32)  # rmsnorm_x with norm-weight W
     attn = np.zeros((seq_len, dim), dtype=np.float32)
     causal = np.triu(np.ones((seq_len, seq_len), dtype=bool), k=1)  # True where key>query
 
@@ -420,7 +423,7 @@ def main():
         def ffn_ref(z):
             z = z.astype(np.float64)
             ms_ = np.mean(z ** 2, axis=1, keepdims=True)
-            zn = z / np.sqrt(ms_ + eps)                     # rmsnorm_z (W2 = ones)
+            zn = (z / np.sqrt(ms_ + eps)) * W2.astype(np.float64)   # rmsnorm_z with norm-weight W2
             up = zn @ Wup.astype(np.float64)                # z1_matmul
             gate = zn @ Wgate.astype(np.float64)            # z2_matmul
             z3 = (gate / (1.0 + np.exp(-gate))) * up        # z3_comp: silu(gate) * up

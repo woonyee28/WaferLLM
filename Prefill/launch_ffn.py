@@ -145,7 +145,10 @@ def main():
     tensor_X[:n_tok] = resid_mid
 
     W2 = weights["norm_post"].reshape(1, dim)
-    tensor_W2 = np.tile(W2.reshape(P, dim_p_pe), reps=(1, P))
+    # wyn: BUG FIX (18 Jul) -- was np.tile(W2.reshape(P,dim_p_pe),(1,P)), which mis-tiled the norm
+    # weight by PY when a PE owns dim block PX (see launch_device.py). norm_post is fairly uniform
+    # so it only cost the FFN ~a few tenths of a % (part of the "fp16 gap"); still wrong. Fixed.
+    tensor_W2 = np.tile(W2.reshape(1, dim), reps=(P, 1))
 
     tensor_gate_weight = weights["gate"]
     tensor_up_weight = weights["up"]

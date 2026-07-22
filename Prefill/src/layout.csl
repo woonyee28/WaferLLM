@@ -275,18 +275,6 @@ layout {
     @export_name("Z", [*]f16, true);
     // wyn: post-attention residual (resid_mid), for attention-only validation
     @export_name("Z_mid", [*]f16, true);
-    // wyn: DEBUG head-0 raw score + XQ pre/post rope + pristine rmsnorm_x output
-    @export_name("score_dbg", [*]f16, true);
-    @export_name("xq_proj_dbg", [*]f16, true);
-    @export_name("xq_rope_dbg", [*]f16, true);
-    @export_name("X_norm_dbg", [*]f16, true);
-    @export_name("xk_trace", [*]f16, true);
-    @export_name("probs_dbg", [*]f16, true);
-    @export_name("xv_dbg", [*]f16, true);
-    @export_name("output_dbg", [*]f16, true);
-    @export_name("h1_dbg", [*]f16, true);
-    @export_name("h1_per_head", [*]f16, true);
-    // wyn: end
 
     @export_name("init_task", fn()void);
     @export_name("prefill_host", fn(i16, i16)void);

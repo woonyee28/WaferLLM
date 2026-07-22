@@ -85,8 +85,8 @@ var shift_round: i16 = 0;
 //     ind[i,j] == sigma^offset_step(i) (j),   sigma = the f-cycle (0 1 3 5 7 6 4 2)
 // so ind[i,j] == sigma^offset_step(j) (i) — a per-COLUMN VERTICAL walk of offset_step(px)
 // hops, the exact mirror of the left's per-row horizontal walk of offset_step(py) hops.
-// mm_two_hop_comm_T is already exactly that vertical shift, and xk_trace measured its
-// direction as +sigma per hop, so offset_step(px) hops of it produce V[sigma^os(px)(i), j].
+// mm_two_hop_comm_T is already exactly that vertical shift, with direction +sigma per hop,
+// so offset_step(px) hops of it produce V[sigma^os(px)(i), j].
 var in_preshift_r: bool = false;
 var pre_remaining_r: i16 = 0;
 var shift_round_r: i16 = 0;
@@ -214,21 +214,13 @@ var ptr_X_norm: [*]f16 = &X_norm_tile;
 // wyn: pristine copy of X_norm. Each head's projection pre-shifts X_norm in place, so we restore
 // this backup before every head — all heads then project the SAME input through their own weights.
 var X_norm_backup: [seq_len_p_pe * dim_p_pe]f16 = @zeros([seq_len_p_pe * dim_p_pe]f16);
-var ptr_X_norm_backup: [*]f16 = &X_norm_backup;   // wyn: DEBUG export (pristine rmsnorm_x output)
+var ptr_X_norm_backup: [*]f16 = &X_norm_backup;   // wyn: pristine rmsnorm_x output, restored before each head's projection
 
 // * XQ, XK, XV: per-head QKV in prefill. One head fills the mesh: head_dim across all P
 // columns (head_dim_p_pe per PE), so each tile is [seq_len_p_pe * head_dim_p_pe].
 var XQ_tile: [seq_len_p_pe * head_dim_p_pe]f16 = @zeros([seq_len_p_pe * head_dim_p_pe]f16);
 var ptr_XQ: [*]f16 = &XQ_tile;
 var XQ_dsd = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{seq_len_p_pe * head_dim_p_pe} -> XQ_tile[i] });
-
-// wyn: DEBUG — head-0 XQ snapshots (pre-rope = projection, post-rope = rope-NN output)
-var xq_proj_dbg: [seq_len_p_pe * head_dim_p_pe]f16 = @zeros([seq_len_p_pe * head_dim_p_pe]f16);
-var ptr_xq_proj_dbg: [*]f16 = &xq_proj_dbg;
-var xq_proj_dbg_dsd = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{seq_len_p_pe * head_dim_p_pe} -> xq_proj_dbg[i] });
-var xq_rope_dbg: [seq_len_p_pe * head_dim_p_pe]f16 = @zeros([seq_len_p_pe * head_dim_p_pe]f16);
-var ptr_xq_rope_dbg: [*]f16 = &xq_rope_dbg;
-var xq_rope_dbg_dsd = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{seq_len_p_pe * head_dim_p_pe} -> xq_rope_dbg[i] });
 
 var XK_tile: [seq_len_p_pe * head_dim_p_pe]f16 = @zeros([seq_len_p_pe * head_dim_p_pe]f16);
 var ptr_XK: [*]f16 = &XK_tile;
@@ -277,43 +269,6 @@ var X_tmp_4_dsd = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{_dim_p_pe / 2} -> 
 var score: [seq_len_p_pe * seq_len_p_pe]f16 = @zeros([seq_len_p_pe * seq_len_p_pe]f16);
 var ptr_score: [*]f16 = &score;
 var score_dsd = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{seq_len_p_pe * seq_len_p_pe} -> score[i] });
-
-// wyn: DEBUG — head-0 raw score (Q.K^T, pre-softmax) snapshot for attention validation
-var score_dbg: [seq_len_p_pe * seq_len_p_pe]f16 = @zeros([seq_len_p_pe * seq_len_p_pe]f16);
-var ptr_score_dbg: [*]f16 = &score_dbg;
-var score_dbg_dsd = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{seq_len_p_pe * seq_len_p_pe} -> score_dbg[i] });
-
-// wyn: DEBUG — head-0 trace of the XK tile each PE actually multiplies at systolic step s.
-// This is what localised the attention bug: its step-0 slice (before any score shift) shows
-// XK already corrupt for odd-offset_step rows, which cleared both the reduce and the score
-// matmul and pointed at the K projection. Keep it until attention is validated end to end;
-// the host side reads it in launch_sim_attn.py ("K projection sanity" check).
-var xk_trace: [P * seq_len_p_pe * head_dim_p_pe]f16 = @zeros([P * seq_len_p_pe * head_dim_p_pe]f16);
-var ptr_xk_trace: [*]f16 = &xk_trace;
-
-// wyn: DEBUG — head-0 inputs to output_matmul, snapshotted where it consumes them. The raw
-// score is validated (cos 0.999999) but attention output is still wrong, so the two never-
-// checked stages are the softmax/causal-mask output (probs) and the V projection.
-var probs_dbg: [seq_len_p_pe * seq_len_p_pe]f16 = @zeros([seq_len_p_pe * seq_len_p_pe]f16);
-var ptr_probs_dbg: [*]f16 = &probs_dbg;
-var xv_dbg: [seq_len_p_pe * head_dim_p_pe]f16 = @zeros([seq_len_p_pe * head_dim_p_pe]f16);
-var ptr_xv_dbg: [*]f16 = &xv_dbg;
-
-// wyn: DEBUG — probs and XV are both validated (cos 1.0), so the remaining suspects are
-// output_matmul (probs@XV), h1_matmul (the O-proj accumulate) and z_add. output_dbg is
-// head-0's output_tile as h1_matmul consumes it; h1_dbg is h1_tile after head 0's O-proj
-// only (snapshotted in the flag==10 head loop), so it isolates one head's contribution.
-var output_dbg: [seq_len_p_pe * head_dim_p_pe]f16 = @zeros([seq_len_p_pe * head_dim_p_pe]f16);
-var ptr_output_dbg: [*]f16 = &output_dbg;
-var h1_dbg: [seq_len_p_pe * dim_p_pe]f16 = @zeros([seq_len_p_pe * dim_p_pe]f16);
-var ptr_h1_dbg: [*]f16 = &h1_dbg;
-
-// wyn: DEBUG per-head cumulative h1 snapshot -- h1 after EACH head's O-proj accumulate,
-// indexed by head_idx (n_heads <= P). The host diffs consecutive heads to get each head's
-// contribution and compares to the numpy oracle -> localizes WHICH head diverges (head 0 is
-// clean at group=4 but the all-heads sum fails, so the bug is a later head / the KV sharing).
-var h1_per_head: [P * seq_len_p_pe * dim_p_pe]f16 = @zeros([P * seq_len_p_pe * dim_p_pe]f16);
-var ptr_h1_per_head: [*]f16 = &h1_per_head;
 
 var h1_tile: [seq_len_p_pe * dim_p_pe]f16 = @zeros([seq_len_p_pe * dim_p_pe]f16);
 var ptr_h1: [*]f16 = &h1_tile;
@@ -516,13 +471,6 @@ fn matmul_T_compute() void {
 
         left_matrix_dsd = @set_dsd_base_addr(left_matrix_dsd, ptr_left_matrix_send);
         right_matrix_dsd = @set_dsd_base_addr(right_matrix_dsd, ptr_right_matrix_send);
-
-        // wyn: DEBUG snapshot the K chunk this PE multiplies at step `step` (head 0 only).
-        if (head_idx == 0) {
-            for (@range(i16, seq_len_p_pe * head_dim_p_pe)) |i| {
-                xk_trace[step * seq_len_p_pe * head_dim_p_pe + i] = ptr_right_matrix_send[i];
-            }
-        }
 
         for (@range(i16, Kt)) |k| {
 
@@ -795,9 +743,7 @@ fn rope_nn(x_ptr: [*]f16) void {
 fn xq_rope() void {
 
     if (head_dim_p_pe == 1) {
-        if (head_idx == 0) { @fmovh(xq_proj_dbg_dsd, XQ_dsd); }   // wyn: DEBUG pre-rope
         rope_nn(ptr_XQ);
-        if (head_idx == 0) { @fmovh(xq_rope_dbg_dsd, XQ_dsd); }   // wyn: DEBUG post-rope
         prefill_struct();
         return;
     }
@@ -893,11 +839,6 @@ fn score_matmul() void {
 
 fn softmax_score() void {
 
-    // wyn: DEBUG — snapshot head-0 raw score before alpha/mask/softmax modify it
-    if (head_idx == 0) {
-        @fmovh(score_dbg_dsd, score_dsd);
-    }
-
     seqLen_dsd_1 = @set_dsd_base_addr(seqLen_dsd_1, ptr_score);
 
     @load_to_dsr(comp_dest_dsr_1, score_dsd);
@@ -988,16 +929,6 @@ fn output_matmul() void {
     @load_to_dsr(comp_dest_dsr_1, output_dsd);
     @fmovh(comp_dest_dsr_1, 0.0);
 
-    // wyn: DEBUG snapshot the two operands of output = probs @ XV, exactly as consumed.
-    if (head_idx == 0) {
-        for (@range(i16, seq_len_p_pe * seq_len_p_pe)) |i| {
-            probs_dbg[i] = score[i];
-        }
-        for (@range(i16, seq_len_p_pe * head_dim_p_pe)) |i| {
-            xv_dbg[i] = XV_tile[i];
-        }
-    }
-
     ptr_left_matrix_send = &seqLen_seqLen_tmp;
     ptr_left_matrix_recv = &score;
 
@@ -1036,11 +967,6 @@ fn h1_matmul() void {
     if (head_idx == 0) {
         @load_to_dsr(comp_dest_dsr_1, h1_dsd);
         @fmovh(comp_dest_dsr_1, 0.0);
-
-        // wyn: DEBUG snapshot output_h exactly as this O-proj is about to consume it
-        for (@range(i16, seq_len_p_pe * head_dim_p_pe)) |i| {
-            output_dbg[i] = output_tile[i];
-        }
     }
 
     ptr_left_matrix_send = &seqLen_dim_tmp;
@@ -1326,17 +1252,6 @@ fn prefill_struct() void {
         // wyn: head-sequential loop. After head_idx's O-proj accumulate into h1, either start
         // the next head's attention, or (all heads done) proceed to the FFN. rmsnorm_x (flag 0)
         // ran once and X_norm is shared across heads.
-        // wyn: DEBUG snapshot h1 after head 0's O-proj only -- head 0's contribution alone,
-        // before any later head accumulates on top.
-        if (head_idx == 0) {
-            for (@range(i16, seq_len_p_pe * dim_p_pe)) |i| {
-                h1_dbg[i] = h1_tile[i];
-            }
-        }
-        // wyn: DEBUG snapshot cumulative h1 for THIS head into the per-head buffer.
-        for (@range(i16, seq_len_p_pe * dim_p_pe)) |i| {
-            h1_per_head[head_idx * seq_len_p_pe * dim_p_pe + i] = h1_tile[i];
-        }
         if (head_idx < n_heads - 1) {
             head_idx += 1;
             kv_head_idx = head_idx / group;
@@ -1477,16 +1392,6 @@ comptime {
     // wyn: export Z
     @export_symbol(ptr_Z, "Z");   // layer output after all processing
     @export_symbol(ptr_Z_mid, "Z_mid");   // wyn: post-attention residual (resid_mid)
-    @export_symbol(ptr_score_dbg, "score_dbg");   // wyn: DEBUG head-0 raw score
-    @export_symbol(ptr_xq_proj_dbg, "xq_proj_dbg");   // wyn: DEBUG head-0 XQ pre-rope
-    @export_symbol(ptr_xq_rope_dbg, "xq_rope_dbg");   // wyn: DEBUG head-0 XQ post-rope
-    @export_symbol(ptr_X_norm_backup, "X_norm_dbg");  // wyn: DEBUG pristine rmsnorm_x output
-    @export_symbol(ptr_xk_trace, "xk_trace");     // wyn: DEBUG head-0 per-step XK tile
-    @export_symbol(ptr_probs_dbg, "probs_dbg");   // wyn: DEBUG head-0 post-softmax probs
-    @export_symbol(ptr_xv_dbg, "xv_dbg");         // wyn: DEBUG head-0 XV as output_matmul sees it
-    @export_symbol(ptr_output_dbg, "output_dbg"); // wyn: DEBUG head-0 probs@XV
-    @export_symbol(ptr_h1_dbg, "h1_dbg");         // wyn: DEBUG h1 after head-0 O-proj only
-    @export_symbol(ptr_h1_per_head, "h1_per_head"); // wyn: DEBUG per-head cumulative h1
     // wyn: end
     @export_symbol(init_task);
     @export_symbol(prefill_host);

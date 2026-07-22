@@ -183,11 +183,17 @@ def main():
     tensor_X[:n_tok] = resid_pre
 
     W = weights["norm_pre"].reshape(1, dim)
-    tensor_W = np.tile(W.reshape(P, dim_p_pe), reps=(1, P))
+    # wyn: BUG FIX (device root cause, 18 Jul). Was np.tile(W.reshape(P,dim_p_pe),(1,P)), which
+    # gives PE(py,px) the norm-weight chunk indexed by PY -- but a PE owns dim block PX. So every
+    # sequence row applied ONE wrong W chunk to all dims (verified: eff row = W[0:dpp] repeated).
+    # Invisible on the sim (W=ones) and only mildly hurt the FFN (norm_post ~uniform), but with
+    # non-uniform norm_pre it collapsed rmsnorm_x to cos 0.25 -> broke ALL attention heads.
+    # Correct: each mesh row gets the FULL W; memcpy [py,px,d] then slices dim block px.
+    tensor_W = np.tile(W.reshape(1, dim), reps=(P, 1))
 
     # wyn: second norm weight (post_attention_layernorm) for rmsnorm_z
     W2 = weights["norm_post"].reshape(1, dim)
-    tensor_W2 = np.tile(W2.reshape(P, dim_p_pe), reps=(1, P))
+    tensor_W2 = np.tile(W2.reshape(1, dim), reps=(P, 1))   # wyn: same tiling fix as W (see above)
     # wyn: end
 
     tensor_q_weight = weights["q"]
@@ -423,30 +429,6 @@ def main():
         Zmid_1d = sdk_utils.memcpy_view(Zmid_1d_u32, np.dtype(np.float16))
         Zmid_layer0 = untile_flat_1d(Zmid_1d, P, seq_len_p_pe, dim_p_pe)   # (seq_len, dim)
 
-        # wyn: DEBUG — head-0 raw score [query, key], for attention isolation
-        sc_u32 = np.zeros(P * P * seq_len_p_pe * seq_len_p_pe, dtype=np.uint32)
-        runner.memcpy_d2h(sc_u32, runner.get_id("score_dbg"), 0, 0, P, P, seq_len_p_pe * seq_len_p_pe,
-                          streaming=False, order=memcpy_order, data_type=io_dtype, nonblock=False)
-        sc = sdk_utils.memcpy_view(sc_u32, np.dtype(np.float16))
-        score_dbg = untile_flat_1d(sc, P, seq_len_p_pe, seq_len_p_pe)   # [query, key]
-        np.save("csl_dbg_score.npy", score_dbg)
-
-        # wyn: DEBUG — head-0 XQ pre/post rope [seq, head_dim] (cols in rope-perm order)
-        def _read_xq(sym):
-            b = np.zeros(P * P * seq_len_p_pe * head_dim_p_pe, dtype=np.uint32)
-            runner.memcpy_d2h(b, runner.get_id(sym), 0, 0, P, P, seq_len_p_pe * head_dim_p_pe,
-                              streaming=False, order=memcpy_order, data_type=io_dtype, nonblock=False)
-            return untile_flat_1d(sdk_utils.memcpy_view(b, np.dtype(np.float16)), P, seq_len_p_pe, head_dim_p_pe)
-        np.save("csl_dbg_xq_proj.npy", _read_xq("xq_proj_dbg"))
-        np.save("csl_dbg_xq_rope.npy", _read_xq("xq_rope_dbg"))
-
-        # wyn: DEBUG — pristine rmsnorm_x output [seq, dim]
-        xn_u32 = np.zeros(P * P * seq_len_p_pe * dim_p_pe, dtype=np.uint32)
-        runner.memcpy_d2h(xn_u32, runner.get_id("X_norm_dbg"), 0, 0, P, P, seq_len_p_pe * dim_p_pe,
-                          streaming=False, order=memcpy_order, data_type=io_dtype, nonblock=False)
-        np.save("csl_dbg_xnorm.npy", untile_flat_1d(sdk_utils.memcpy_view(xn_u32, np.dtype(np.float16)), P, seq_len_p_pe, dim_p_pe))
-        # wyn: end
-
     time_start = np.zeros((P, P)).astype(int)
     time_end = np.zeros((P, P)).astype(int)
     word = np.zeros(3).astype(np.uint16)
@@ -532,7 +514,9 @@ def main():
                    else np.pad(resid_mid_ref, ((0, seq_len - resid_mid_ref.shape[0]), (0, 0))))
     np.save("csl_layer0_output.npy", Z_layer0)
     np.save("csl_layer0_resid_mid.npy", Zmid_layer0)
-    # wyn: end
+
+if __name__ == "__main__":
+    main()
 
 if __name__ == "__main__":
     main()
