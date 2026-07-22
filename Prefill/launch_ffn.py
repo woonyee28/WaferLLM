@@ -111,6 +111,12 @@ class Config:
 def parse_args():
     parser = argparse.ArgumentParser(description="FFN-only Prefill on WSE-3")
     parser.add_argument("--config", default="config.json", type=str, help="Config file")
+    # wyn: chain hook. When set, the FFN input (resid_mid) is loaded from this .npy -- the DEVICE
+    # attention Z_mid produced by launch_device.py -- instead of the transformer_lens oracle. This
+    # is what makes launch_layer.py a true end-to-end run (attention output feeds the FFN), not two
+    # independently oracle-fed stages. Omit it to keep the standalone oracle-fed FFN validation.
+    parser.add_argument("--input", default=None, type=str,
+                        help="npy resid_mid input (device Z_mid) to chain; default = oracle")
     args = parser.parse_args()
     return args
 
@@ -135,10 +141,16 @@ def main():
 
     weights = load_ffn_weights()
 
-    # wyn: input = Llama block-0 resid_mid (oracle), so the FFN is validated in isolation.
+    # wyn: input = Llama block-0 resid_mid. Standalone: the transformer_lens oracle (FFN validated
+    # in isolation). Chained (launch_layer.py): --input points at the DEVICE attention Z_mid, so the
+    # FFN runs on the real upstream output -> a true end-to-end disaggregated layer.
     repo_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
     resid_dir = os.path.join(repo_root, "pytorch")
-    resid_mid = np.load(os.path.join(resid_dir, "resid_mid_block0.npy")).astype(np.float16)
+    if args.input is not None:
+        resid_mid = np.load(args.input).astype(np.float16)
+        print(f"[chain] FFN input = device attention Z_mid from {args.input}  shape={resid_mid.shape}")
+    else:
+        resid_mid = np.load(os.path.join(resid_dir, "resid_mid_block0.npy")).astype(np.float16)
     n_tok = resid_mid.shape[0]
     assert n_tok <= seq_len, f"resid_mid has {n_tok} tokens > seq_len {seq_len}"
     tensor_X = np.zeros((seq_len, dim), dtype=np.float16)
