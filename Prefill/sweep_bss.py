@@ -37,7 +37,10 @@ BUILDS = [
     ("ffn        P=256",
      dict(P=256, dim=4096, n_heads=16, n_kv_heads=4, head_dim=256, ffn_dim=14336, ffn_only=1)),
 ]
-SPP = [1, 2, 4, 8, 16]   # seq_len_p_pe values to sweep (seq_len = P * spp)
+# Log points (1,2,4,8,16) show the scaling shape; the fine tail (20..32) walks each
+# build up to its SRAM wall. sweep() breaks automatically when a compile overflows, so
+# FFN halts ~22 and attention (bigger .text, gentler .bss slope) reaches further.
+SPP = [1, 2, 4, 8, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 28, 30, 32]   # seq_len_p_pe (seq_len = P * spp)
 
 
 def worst_pe(out_dir):
