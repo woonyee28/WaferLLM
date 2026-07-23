@@ -637,11 +637,14 @@ fn rmsnorm_x() void {
     @load_to_dsr(comp_dest_dsr_1, seqLen_dsd_1, .{ .save_address = true });
     @load_to_dsr(comp_src0_dsr_1, seqLen_dsd_2, .{ .save_address = true });
 
-    // wyn: local_sum has only seq_len_p_pe entries; local_sum[i] over dim_p_pe read OOB (worked by
-    // luck in the attention compile). seq_len_p_pe==1, so all dims share one norm factor — read once.
-    var nf: f16 = ptr_local_sum[0];
+    // wyn: per-token RMS factor. local_sum holds one factor per seq row (local_sum[0..seq_len_p_pe]).
+    // X_norm is [dim_p_pe][seq_len_p_pe]; each dim row's seq_len_p_pe entries must be scaled by the
+    // matching per-token factor. Load local_sum as a seq_len_p_pe vector with save_address=false so it
+    // re-reads for every dim row -> X_norm[d][s] *= local_sum[s]. Correct for seq_len_p_pe>=1; the old
+    // scalar local_sum[0] normalized only token 0, corrupting every later token when seq_len_p_pe>1.
+    @load_to_dsr(comp_src1_dsr_1, local_sum_dsd, .{ .save_address = false });
     for (@range(i16, dim_p_pe)) |i| {
-        @fmulh(comp_dest_dsr_1, comp_src0_dsr_1, nf);
+        @fmulh(comp_dest_dsr_1, comp_src0_dsr_1, comp_src1_dsr_1);
     }
 
     // wyn: stash pristine X_norm for the per-head loop to restore before each head's pre-shift
@@ -1112,12 +1115,14 @@ fn rmsnorm_z() void {
     @load_to_dsr(comp_dest_dsr_1, seqLen_dsd_1, .{ .save_address = true });
     @load_to_dsr(comp_src0_dsr_1, seqLen_dsd_2, .{ .save_address = true });
 
-    // wyn: local_sum has only seq_len_p_pe entries; the old local_sum[i] over dim_p_pe read OOB
-    // garbage (masked in the attention compile). seq_len_p_pe==1 here, so every dim shares one
-    // norm factor — read it once and apply to all dims.
-    var nf: f16 = ptr_local_sum[0];
+    // wyn: per-token RMS factor. local_sum holds one factor per seq row (local_sum[0..seq_len_p_pe]).
+    // Z_norm is [dim_p_pe][seq_len_p_pe]; each dim row's seq_len_p_pe entries must be scaled by the
+    // matching per-token factor. Load local_sum as a seq_len_p_pe vector with save_address=false so it
+    // re-reads for every dim row -> Z_norm[d][s] *= local_sum[s]. Correct for seq_len_p_pe>=1; the old
+    // scalar local_sum[0] normalized only token 0, corrupting every later token when seq_len_p_pe>1.
+    @load_to_dsr(comp_src1_dsr_1, local_sum_dsd, .{ .save_address = false });
     for (@range(i16, dim_p_pe)) |i| {
-        @fmulh(comp_dest_dsr_1, comp_src0_dsr_1, nf);
+        @fmulh(comp_dest_dsr_1, comp_src0_dsr_1, comp_src1_dsr_1);
     }
 
     prefill_struct();
