@@ -342,10 +342,15 @@ var X_tile: [bsz * dim_p_pe]f16 = @zeros([bsz * dim_p_pe]f16);
 var ptr_X: [*]f16 = &X_tile;
 var X_dsd = @get_dsd(mem1d_dsd, .{ .base_address = &X_tile, .extent = bsz * dim_p_pe });
 
-// * W: RMSNorm weights
+// * W: RMSNorm weights. W = input_layernorm (pre-attn), W2 = post_attention_layernorm (pre-FFN).
+// Upstream reused W for both; real Llama has two distinct norm weights (cf. Prefill ab1eec4).
 var W_tile: [dim_p_pe]f16 = @zeros([dim_p_pe]f16);
 var ptr_W: [*]f16 = &W_tile;
 var W_dsd = @get_dsd(mem1d_dsd, .{ .base_address = &W_tile, .extent = dim_p_pe });
+
+var W2_tile: [dim_p_pe]f16 = @zeros([dim_p_pe]f16);
+var ptr_W2: [*]f16 = &W2_tile;
+var W2_dsd = @get_dsd(mem1d_dsd, .{ .base_address = &W2_tile, .extent = dim_p_pe });
 
 // * Q_weight, K_weight, V_weight: QKV weights input
 var Q_weight_tile: [dim_p_pe * dim_p_pe]f16 = @zeros([dim_p_pe * dim_p_pe]f16);
@@ -959,7 +964,7 @@ fn rmsnorm_z() void {
     dim_p_pe_dsd_2 = @set_dsd_base_addr(dim_p_pe_dsd_2, ptr_Z);   // Z, not X_tmp(=Z^2): RMSNorm numerator is Z
     @load_to_dsr(dest_dsr_1, dim_p_pe_dsd_1, .{ .save_address = true });
     @load_to_dsr(src0_dsr_1, dim_p_pe_dsd_2, .{ .save_address = true });
-    @load_to_dsr(src1_dsr_1, W_dsd, .{ .save_address = false });
+    @load_to_dsr(src1_dsr_1, W2_dsd, .{ .save_address = false });   // post-attention norm weight (not W)
     for (@range(i16, bsz)) |b| {
         @fmulh(dest_dsr_1, src0_dsr_1, src1_dsr_1);
     }
@@ -1195,6 +1200,7 @@ fn f_reference_timestamps() void {
 comptime {
     @export_symbol(ptr_X, "X");
     @export_symbol(ptr_W, "W");
+    @export_symbol(ptr_W2, "W2");
     @export_symbol(ptr_Q_weight, "Q_weight");
     @export_symbol(ptr_K_weight, "K_weight");
     @export_symbol(ptr_V_weight, "V_weight");
