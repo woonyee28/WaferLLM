@@ -572,7 +572,7 @@ fn rmsnorm_x() void {
 fn xq_matvec_mult() void {
     @fmovh(Q_dsd, 0.0);
 
-    left_vector_dsd = @set_dsd_base_addr(left_vector_dsd, ptr_X); // ptr_X_norm);
+    left_vector_dsd = @set_dsd_base_addr(left_vector_dsd, ptr_X_norm);   // QKV projects the RMSNorm output, not raw X
 
     ptr_right_matrix = &Q_weight_tile;
 
@@ -590,7 +590,7 @@ fn xq_matvec_mult() void {
 fn xk_matvec_mult() void {
     @fmovh(K_dsd, 0.0);
 
-    left_vector_dsd = @set_dsd_base_addr(left_vector_dsd, ptr_X); // ptr_X_norm);
+    left_vector_dsd = @set_dsd_base_addr(left_vector_dsd, ptr_X_norm);   // QKV projects the RMSNorm output, not raw X
 
     ptr_right_matrix = &K_weight_tile;
 
@@ -606,7 +606,7 @@ fn xk_matvec_mult() void {
 fn xv_matvec_mult() void {
     @fmovh(V_dsd, 0.0);
 
-    left_vector_dsd = @set_dsd_base_addr(left_vector_dsd, ptr_X); // ptr_X_norm);
+    left_vector_dsd = @set_dsd_base_addr(left_vector_dsd, ptr_X_norm);   // QKV projects the RMSNorm output, not raw X
 
     ptr_right_matrix = &V_weight_tile;
 

@@ -15,17 +15,17 @@ from cerebras.sdk.runtime.sdkruntimepybind import MemcpyDataType, MemcpyOrder
 
 EPS = 1e-6   # matches CSL: const eps: f16 = 0.000001
 
-def rmsnorm_csl(X, W, head_dim):
+def rmsnorm_csl(X, W, norm_dim):
     """
-    CSL formula (decode.csl rmsnorm_x):
-      X_tmp = X^2
-      local_sum[b] = sum(X_tmp[b])  → Y-reduced globally
-      X_norm[b] = X_tmp[b] * W / sqrt(local_sum[b] / head_dim + eps)
+    Faithful RMSNorm — matches the hardened decode.csl rmsnorm_x:
+      ss[b]     = sum_d X[b,d]^2            (Y-reduced over the full model dim)
+      X_norm[b] = X[b] * W / sqrt(ss[b] / norm_dim + eps)
+    Numerator is X (not X^2), divisor is the full model dim (not head_dim).
     """
     x32 = X.astype(np.float32)
     w32 = W.astype(np.float32)
     ss = np.sum(x32 ** 2, axis=-1, keepdims=True)
-    return (x32**2 * w32 / np.sqrt(ss / head_dim + EPS)).astype(np.float16)
+    return (x32 * w32 / np.sqrt(ss / norm_dim + EPS)).astype(np.float16)
 
 def rope_csl(x, freqs_cos, freqs_sin):
     """
@@ -78,8 +78,8 @@ def compute_reference(X, W_norm, W_Q_perm, W_K, W_V, freqs_cos, freqs_sin,
     alpha = np.float16(1.0 / np.sqrt(head_dim))
     bsz = X.shape[0]
 
-    # Step 1: RMSNorm disabled
-    X_norm = X
+    # Step 1: RMSNorm (faithful — numerator X, divisor = full model dim = P*dim_p_pe)
+    X_norm = rmsnorm_csl(X, W_norm, P * dim_p_pe)
 
     # Step 2: Projections using permuted W_Q and compact W_K/V
     Q_perm = (X_norm.astype(np.float32) @ W_Q_perm.astype(np.float32)).astype(np.float16)  # [bsz, dim]
