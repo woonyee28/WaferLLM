@@ -17,10 +17,13 @@
 param P: i16;
 param bsz: i16;
 param dim_p_pe: i16;
+param kv_dim_p_pe: i16;
 param pes_p_head: i16;
 param pes_p_kv_head: i16;
 param head_dim_p_pe: i16;
-param seq_len_p_pe: i16;
+param head_dim: i16;
+param max_seq_len_p_pe: i16;
+param prefill_len_p_pe: i16;
 param ffn_dim_p_pe: i16;
 
 param pe_num_p_group: i16;
@@ -39,9 +42,17 @@ const memcpy = @import_module( "<memcpy/get_params>", .{
     .height = P,
 });
 
-// comm_layout.csl is no longer imported: per-PE routing is computed at runtime
-// inside comm_pe.csl from each PE's coordinate, so the layout no longer needs the
-// comptime get_params() that produced (and specialized) per-PE route structs.
+const math = @import_module("<math>");
+
+const comm = @import_module("comm_lib/comm_layout.csl", .{
+    .P = P, .pes_p_head = pes_p_head, .pes_p_kv_head = pes_p_kv_head,
+    .pe_num_p_group = pe_num_p_group,
+    .root_1st_phase = root_1st_phase,
+    .root_2nd_phase = root_2nd_phase,
+    .broadcast_color = C_BD,
+    .reduce_1st_color = [2]color{C_1st_RD_0, C_1st_RD_1},
+    .reduce_2nd_color = [2]color{C_2nd_RD_0, C_2nd_RD_1},
+});
 
 layout {
     @set_rectangle(P, P);
@@ -52,25 +63,31 @@ layout {
     px = 0;
     while (px < P) : (px += 1) {
 
+        const quotient_x: i16 = @as(i16, math.floor_f16(@as(f16, px) / @as(f16, pe_num_p_group)));
+        const remainder_x: i16 = px - quotient_x * pe_num_p_group;
+
         const memcpy_params = memcpy.get_params(px);
 
         py = 0;
         while (py < P) : (py += 1) {
 
+            const quotient_y: i16 = @as(i16, math.floor_f16(@as(f16, py) / @as(f16, pe_num_p_group)));
+            const remainder_y: i16 = py - quotient_y * pe_num_p_group;
+            
+            const comm_params = comm.get_params(px, quotient_x, remainder_x, py, quotient_y, remainder_y);
+
             @set_tile_code(px, py, "decode.csl", .{
                 .memcpy_params = memcpy_params,
-
-                .reduce_1st_color_0 = C_1st_RD_0,
-                .reduce_1st_color_1 = C_1st_RD_1,
-                .reduce_2nd_color_0 = C_2nd_RD_0,
-                .reduce_2nd_color_1 = C_2nd_RD_1,
-                .broadcast_color = C_BD,
+                .comm_params = comm_params,
 
                 .P = P, .bsz = bsz, .dim_p_pe = dim_p_pe,
+                .kv_dim_p_pe = kv_dim_p_pe,
                 .pes_p_head = pes_p_head,
                 .pes_p_kv_head = pes_p_kv_head,
                 .head_dim_p_pe = head_dim_p_pe,
-                .seq_len_p_pe = seq_len_p_pe,
+                .head_dim = head_dim,
+                .max_seq_len_p_pe = max_seq_len_p_pe,
+                .prefill_len_p_pe = prefill_len_p_pe,
                 .ffn_dim_p_pe = ffn_dim_p_pe,
 
                 .pe_num_p_group = pe_num_p_group,
@@ -100,4 +117,14 @@ layout {
 
     @export_name("timer_buf", [*]f32, true);
     @export_name("time_ref", [*]f32, true);
+    @export_name("debug", [*]f16, true);
+
+    // Intermediate buffers for host-side validation
+    @export_name("QKV_post_proj",   [*]f16, true);
+    @export_name("QKV_post_reduce", [*]f16, true);
+    @export_name("QKV_tile",        [*]f16, true);
+    @export_name("score_post_gemv",   [*]f16, true);
+    @export_name("score_post_reduce", [*]f16, true);
+    @export_name("score",           [*]f16, true);
+    @export_name("output_tile",     [*]f16, true);
 }

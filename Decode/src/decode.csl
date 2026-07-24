@@ -1,13 +1,5 @@
-param memcpy_params;
-
-// Reduce/broadcast colors (global, identical on every PE). The per-PE routing
-// itself is computed at runtime inside comm_pe.csl from this PE's coordinate,
-// so the layout no longer passes per-PE comptime route structs.
-param reduce_1st_color_0: color;
-param reduce_1st_color_1: color;
-param reduce_2nd_color_0: color;
-param reduce_2nd_color_1: color;
-param broadcast_color: color;
+param memcpy_params: comptime_struct;
+param comm_params: comptime_struct;
 
 // -------------------------------------------------------------------------- //
 // ---------------------------- Model Parameters ---------------------------- //
@@ -16,17 +8,52 @@ param broadcast_color: color;
 param P: i16;
 param bsz: i16;
 param dim_p_pe: i16;
+param kv_dim_p_pe: i16;
 param pes_p_head: i16;
 param pes_p_kv_head: i16;
 param head_dim_p_pe: i16;
-param seq_len_p_pe: i16;
+param head_dim: i16;
+param max_seq_len_p_pe: i16;
+param prefill_len_p_pe: i16;
 param ffn_dim_p_pe: i16;
 
 const _dim_p_pe: i16 = (dim_p_pe / 2) * 2;
+const _kv_dim_p_pe: i16 = (kv_dim_p_pe / 2) * 2;
+const gqa_group_size: i16 = dim_p_pe / kv_dim_p_pe;
 
 param pe_num_p_group: i16;
 param root_1st_phase: i16;
 param root_2nd_phase: i16;
+
+const trace = @import_module(
+  "<debug>",
+  .{ .key = "debug_main",
+     .buffer_size = 100,
+   }
+);
+const simprint = @import_module("<simprint>");
+
+fn simprint_pe_coords_dsd( dsd : mem1d_dsd) void {
+  simprint.print_string("PE : ");
+  simprint.print_string("(");
+  simprint.print_u16_decimal(@as(u16, px));
+  simprint.print_string(",");
+  simprint.print_u16_decimal(@as(u16, py));
+  simprint.print_string("): [");
+  @map(print_data, dsd);
+  simprint.print_string("] ");
+}
+
+fn print_data(curL : f16) void {
+  simprint.print_f16(curL);
+  simprint.print_string(", ");
+}
+
+// -------------------------------------------------------------------------- //
+// -------------------------------- Task IDs -------------------------------- //
+// -------------------------------------------------------------------------- //
+
+
 
 // -------------------------------------------------------------------------- //
 // ------------------------------ PE Variables ------------------------------ //
@@ -40,7 +67,19 @@ var remainder_x: i16 = 0;
 var quotient_y: i16 = 0;
 var remainder_y: i16 = 0;
 
-var head_dim: f16 = @as(f16,P * head_dim_p_pe);
+// Head-local coordinates for head-scoped score reduce
+var px_in_head: i16 = 0;
+var quotient_x_in_head: i16 = 0;
+
+// KV-head-local coordinates for kv-head-scoped score reduce
+var px_in_kv_head: i16 = 0;
+var quotient_x_in_kv_head: i16 = 0;
+
+// Incremental KV cache state
+var iter_num: i16 = 0;   // tokens cached at this PE (initialized to prefill_len_p_pe in init_task)
+var step: i16 = 0;       // global decode step counter (which PE row caches this token)
+
+const head_dim_f16: f16 = @as(f16, head_dim);
 
 const eps: f16 = 0.000001;
 var alpha: f16 = 0.0;
@@ -53,25 +92,21 @@ const sys_mod = @import_module("<memcpy/memcpy>", memcpy_params);
 const math = @import_module("<math>");
 const layout_mod = @import_module("<layout>");
 
-const comm_mod = @import_module("comm_lib/comm_pe.csl", .{
-    .reduce_1st_color_0 = reduce_1st_color_0,
-    .reduce_1st_color_1 = reduce_1st_color_1,
-    .reduce_2nd_color_0 = reduce_2nd_color_0,
-    .reduce_2nd_color_1 = reduce_2nd_color_1,
-    .broadcast_color = broadcast_color,
-
-    .P = P, .bsz = bsz, .dim_p_pe = dim_p_pe,
-    .seq_len_p_pe = seq_len_p_pe,
+const comm_mod = @import_module("comm_lib/comm_pe.csl", @concat_structs(comm_params, .{
+    .P = P, .bsz = bsz, .dim_p_pe = dim_p_pe, .kv_dim_p_pe = kv_dim_p_pe,
+    .pes_p_head = pes_p_head, .pes_p_kv_head = pes_p_kv_head,
+    .max_seq_len_p_pe = max_seq_len_p_pe,
     .ffn_dim_p_pe = ffn_dim_p_pe,
 
     .pe_num_p_group = pe_num_p_group,
     .root_1st_phase = root_1st_phase, .root_2nd_phase = root_2nd_phase,
-});
+}));
 // -------------------------------------------------------------------------- //
 // ------------------------------ Timer Module ------------------------------ //
 // -------------------------------------------------------------------------- //
 
 const timestamp = @import_module("<time>");
+const layout_module = @import_module("<layout>");
 
 var tsc_end_buf = @zeros([timestamp.tsc_size_words]u16);
 var tsc_start_buf = @zeros([timestamp.tsc_size_words]u16);
@@ -99,9 +134,17 @@ fn init_task() void {
     quotient_y = @as(i16, math.floor_f16(@as(f16, py) / @as(f16, pe_num_p_group)));
     remainder_y = py - quotient_y * pe_num_p_group;
 
-    comm_mod.init(px, py, quotient_x, remainder_x, quotient_y, remainder_y);
+    px_in_head = px % pes_p_head;
+    quotient_x_in_head = px_in_head / pe_num_p_group;
 
-    alpha = 1.0 / @as(f16, math.sqrt(head_dim));
+    px_in_kv_head = px % pes_p_kv_head;
+    quotient_x_in_kv_head = px_in_kv_head / pe_num_p_group;
+
+    comm_mod.init();
+
+    iter_num = prefill_len_p_pe;
+
+    alpha = 1.0 / @as(f16, math.sqrt(head_dim_f16));
 
     sys_mod.unblock_cmd_stream();
 }
@@ -130,13 +173,17 @@ fn gemv_static_step(cur: f16) void {
     @fmach(dest_dsr_1, src0_dsr_1, src1_dsr_1, cur);
 }
 
+fn fmulh_func(cur: f16) void {
+    @fmulh(dest_dsr_1, src0_dsr_1, cur);
+}
+
 fn fsubh_func(cur: f16) void {
     @fsubh(dest_dsr_1, src0_dsr_1, cur);
 }
 
 var cur_: f16 = 0.0;
 fn fmulh_norm_func(cur: f16) void {
-    cur_ = cur / head_dim;
+    cur_ = cur / head_dim_f16;
     cur_ = 1.0 / math.sqrt(cur_ + eps);
     @fmulh(dest_dsr_1, src0_dsr_1, cur_);
 }
@@ -168,8 +215,8 @@ var out_vector_dsd = @get_dsd(mem1d_dsd, .{ .base_address = &dummy, .extent = 1 
 
 var dim_p_pe_dsd_1 = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{dim_p_pe} -> dummy[i] });
 var dim_p_pe_dsd_2 = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{dim_p_pe} -> dummy[i] });
-var seq_len_p_pe_dsd_1 = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{seq_len_p_pe} -> dummy[i] });
-var seq_len_p_pe_dsd_2 = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{seq_len_p_pe} -> dummy[i] });
+var max_seq_len_p_pe_dsd_1 = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{max_seq_len_p_pe} -> dummy[i] });
+var max_seq_len_p_pe_dsd_2 = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{max_seq_len_p_pe} -> dummy[i] });
 var ffn_dim_p_pe_dsd_1 = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{ffn_dim_p_pe} -> dummy[i] });
 var ffn_dim_p_pe_dsd_2 = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{ffn_dim_p_pe} -> dummy[i] });
 
@@ -197,6 +244,93 @@ fn vecmat_computation() void {
 }
 
 // -------------------------------------------------------------------------- //
+// -------------- Variable-length GEMV and KV cache write helpers ----------- //
+// -------------------------------------------------------------------------- //
+
+// Copy size elements from src to dest in a 2D-strided pattern (for each of bsz batches).
+// stride_dest_inner / stride_src_inner: element stride within each row (1 = contiguous).
+// stride_dest_outer / stride_src_outer: offset added per batch iteration.
+fn range_copy_2d_strided(dest: *f16, src: *f16, size: u16, stride_dest_outer: i16, stride_dest_inner: i8, stride_src_outer: i16, stride_src_inner: i8) void {
+    var dest_dsd = @get_dsd(mem1d_dsd, .{
+        .base_address = dest,
+        .extent = size,
+        .stride = stride_dest_inner,
+    });
+    var src_dsd = @get_dsd(mem1d_dsd, .{
+        .base_address = src,
+        .extent = size,
+        .stride = stride_src_inner,
+    });
+    for (@range(i16, bsz)) |b| {
+        @load_to_dsr(dest_dsr_1, dest_dsd, .{ .save_address = false });
+        @load_to_dsr(src1_dsr_1, src_dsd, .{ .save_address = false });
+        @fmovh(dest_dsr_1, src1_dsr_1);
+        dest_dsd = @increment_dsd_offset(dest_dsd, stride_dest_outer, f16);
+        src_dsd = @increment_dsd_offset(src_dsd, stride_src_outer, f16);
+    }
+}
+
+// Write new K and V tokens to on-chip cache at position iter_num.
+// Called only by the owning PE (py == step % P). Increments iter_num.
+// K cache layout: [bsz, kv_dim_p_pe, max_seq_len_p_pe] — bsz slowest.
+//   Per batch: write column iter_num via stride max_seq_len_p_pe.
+//   range_copy_2d_strided iterates over bsz with stride kv_dim_p_pe*max_seq_len_p_pe.
+// V cache layout: [bsz, max_seq_len_p_pe, kv_dim_p_pe] — bsz slowest.
+//   Per batch: write row iter_num contiguously.
+//   range_copy_2d_strided iterates over bsz with stride max_seq_len_p_pe*kv_dim_p_pe.
+fn process_kv() void {
+    var remain: i16 = step % P;
+    if (py == remain) {
+        range_copy_2d_strided(&XKCache_tile[iter_num], &QKV_tile[bsz * dim_p_pe],
+            kv_dim_p_pe, kv_dim_p_pe * max_seq_len_p_pe, @as(i8, max_seq_len_p_pe), kv_dim_p_pe, 1);
+        range_copy_2d_strided(&XVCache_tile[iter_num * kv_dim_p_pe], &QKV_tile[bsz * (dim_p_pe + kv_dim_p_pe)],
+            kv_dim_p_pe, max_seq_len_p_pe * kv_dim_p_pe, 1, kv_dim_p_pe, 1);
+        iter_num += 1;
+    }
+}
+
+// Variable-length V-side GEMV: Kt and Nt set by caller, right matrix stride = width_right.
+// Used for output GEMV where Kt = iter_num (variable) and Nt = kv_dim_p_pe (fixed).
+fn vecmat_computation_var_right(width_right: i16) void {
+    left_vector_dsd = @set_dsd_length(left_vector_dsd, @bitcast(u16, Kt));
+    right_matrix_dsd = @set_dsd_length(right_matrix_dsd, @bitcast(u16, Nt));
+    out_vector_dsd = @set_dsd_length(out_vector_dsd, @bitcast(u16, Nt));
+    right_matrix_dsd = @set_dsd_base_addr(right_matrix_dsd, ptr_right_matrix);
+
+    for (@range(i16, bsz)) |b| {
+        @load_to_dsr(dest_dsr_1, out_vector_dsd, .{ .save_address = false });
+        @load_to_dsr(src0_dsr_1, out_vector_dsd, .{ .save_address = false });
+        @load_to_dsr(src1_dsr_1, right_matrix_dsd, .{ .save_address = true });
+        @map(gemv_static_step, left_vector_dsd);
+        left_vector_dsd = @increment_dsd_offset(left_vector_dsd, Kt, f16);
+        out_vector_dsd = @increment_dsd_offset(out_vector_dsd, Nt, f16);
+        right_matrix_dsd = @increment_dsd_offset(right_matrix_dsd, width_right, f16);
+    }
+}
+
+// Variable-length K^T GEMV with 2D stride: Nt = iter_num, Kt = kv_dim_p_pe.
+// Each K-dim row is at stride right_stride = max_seq_len_p_pe apart.
+// Used for score GEMV where the number of tokens (Nt) grows over time.
+fn vecmat_computation_var_right_2d_strided(right_stride: i16) void {
+    left_vector_dsd = @set_dsd_length(left_vector_dsd, 1);
+    right_matrix_dsd = @set_dsd_length(right_matrix_dsd, @bitcast(u16, Nt));
+    out_vector_dsd = @set_dsd_length(out_vector_dsd, @bitcast(u16, Nt));
+    right_matrix_dsd = @set_dsd_base_addr(right_matrix_dsd, ptr_right_matrix);
+
+    for (@range(i16, bsz)) |b| {
+        @load_to_dsr(dest_dsr_1, out_vector_dsd, .{ .save_address = false });
+        @load_to_dsr(src0_dsr_1, out_vector_dsd, .{ .save_address = false });
+        for (@range(i16, Kt)) |k| {
+            @load_to_dsr(src1_dsr_1, right_matrix_dsd, .{ .save_address = false });
+            @map(gemv_static_step, left_vector_dsd);
+            left_vector_dsd = @increment_dsd_offset(left_vector_dsd, 1, f16);
+            right_matrix_dsd = @increment_dsd_offset(right_matrix_dsd, right_stride, f16);
+        }
+        out_vector_dsd = @increment_dsd_offset(out_vector_dsd, Nt, f16);
+    }
+}
+
+// -------------------------------------------------------------------------- //
 // ----------------------------- Model Parameters --------------------------- //
 // -------------------------------------------------------------------------- //
 
@@ -215,13 +349,13 @@ var Q_weight_tile: [dim_p_pe * dim_p_pe]f16 = @zeros([dim_p_pe * dim_p_pe]f16);
 var ptr_Q_weight: [*]f16 = &Q_weight_tile;
 var Q_weight_dsd = @get_dsd(mem1d_dsd, .{ .base_address = &Q_weight_tile, .extent = dim_p_pe * dim_p_pe });
 
-var K_weight_tile: [dim_p_pe * dim_p_pe]f16 = @zeros([dim_p_pe * dim_p_pe]f16);
+var K_weight_tile: [dim_p_pe * kv_dim_p_pe]f16 = @zeros([dim_p_pe * kv_dim_p_pe]f16);
 var ptr_K_weight: [*]f16 = &K_weight_tile;
-var K_weight_dsd = @get_dsd(mem1d_dsd, .{ .base_address = &K_weight_tile, .extent = dim_p_pe * dim_p_pe });
+var K_weight_dsd = @get_dsd(mem1d_dsd, .{ .base_address = &K_weight_tile, .extent = dim_p_pe * kv_dim_p_pe });
 
-var V_weight_tile: [dim_p_pe * dim_p_pe]f16 = @zeros([dim_p_pe * dim_p_pe]f16);
+var V_weight_tile: [dim_p_pe * kv_dim_p_pe]f16 = @zeros([dim_p_pe * kv_dim_p_pe]f16);
 var ptr_V_weight: [*]f16 = &V_weight_tile;
-var V_weight_dsd = @get_dsd(mem1d_dsd, .{ .base_address = &V_weight_tile, .extent = dim_p_pe * dim_p_pe });
+var V_weight_dsd = @get_dsd(mem1d_dsd, .{ .base_address = &V_weight_tile, .extent = dim_p_pe * kv_dim_p_pe });
 
 var freqs_sin: [_dim_p_pe / 2]f16 = @zeros([_dim_p_pe / 2]f16);
 var ptr_freqs_sin: [*]f16 = &freqs_sin;
@@ -231,23 +365,31 @@ var freqs_cos: [_dim_p_pe / 2]f16 = @zeros([_dim_p_pe / 2]f16);
 var ptr_freqs_cos: [*]f16 = &freqs_cos;
 var freqs_cos_dsd = @get_dsd(mem1d_dsd, .{ .base_address = &freqs_cos, .extent = _dim_p_pe / 2 });
 
-var XKCache_tile: [dim_p_pe * seq_len_p_pe]f16 = @zeros([dim_p_pe * seq_len_p_pe]f16);
+// KV cache: [bsz, kv_dim_p_pe, max_seq_len_p_pe] and [bsz, max_seq_len_p_pe, kv_dim_p_pe]
+// bsz is the slowest (outermost) dimension — each batch element has its own cache.
+var XKCache_tile: [bsz * kv_dim_p_pe * max_seq_len_p_pe]f16 = @zeros([bsz * kv_dim_p_pe * max_seq_len_p_pe]f16);
 var ptr_XKCache: [*]f16 = &XKCache_tile;
+var XKCache_dsd = @get_dsd(mem1d_dsd, .{ .base_address = &XKCache_tile, .extent = bsz * kv_dim_p_pe * max_seq_len_p_pe });
 
-var XVCache_tile: [seq_len_p_pe * dim_p_pe]f16 = @zeros([seq_len_p_pe * dim_p_pe]f16);
+var XVCache_tile: [bsz * max_seq_len_p_pe * kv_dim_p_pe]f16 = @zeros([bsz * max_seq_len_p_pe * kv_dim_p_pe]f16);
 var ptr_XVCache: [*]f16 = &XVCache_tile;
+var XVCache_dsd = @get_dsd(mem1d_dsd, .{ .base_address = &XVCache_tile, .extent = bsz * max_seq_len_p_pe * kv_dim_p_pe });
 
 var O_weight_tile: [dim_p_pe * dim_p_pe]f16 = @zeros([dim_p_pe * dim_p_pe]f16);
 var ptr_O_weight: [*]f16 = &O_weight_tile;
+// var O_weight_dsd = @get_dsd(mem1d_dsd, .{ .base_address = &O_weight_tile, .extent = dim_p_pe });
 
 var UP_weight_tile: [dim_p_pe * ffn_dim_p_pe]f16 = @zeros([dim_p_pe * ffn_dim_p_pe]f16);
 var ptr_UP_weight: [*]f16 = &UP_weight_tile;
+// var UP_weight_dsd = @get_dsd(mem1d_dsd, .{ .base_address = &UP_weight_tile, .extent = ffn_dim_p_pe });
 
 var GATE_weight_tile: [dim_p_pe * ffn_dim_p_pe]f16 = @zeros([dim_p_pe * ffn_dim_p_pe]f16);
 var ptr_GATE_weight: [*]f16 = &GATE_weight_tile;
+// var GATE_weight_dsd = @get_dsd(mem1d_dsd, .{ .base_address = &GATE_weight_tile, .extent = ffn_dim_p_pe });
 
 var DOWN_weight_tile: [dim_p_pe * ffn_dim_p_pe]f16 = @zeros([dim_p_pe * ffn_dim_p_pe]f16);
 var ptr_DOWN_weight: [*]f16 = &DOWN_weight_tile;
+// var DOWN_weight_dsd = @get_dsd(mem1d_dsd, .{ .base_address = &DOWN_weight_tile, .extent = dim_p_pe });
 
 // ************************ Middle Results ************************ //
 
@@ -257,6 +399,7 @@ var X_tmp_dsd = @get_dsd(mem1d_dsd, .{ .base_address = &X_tmp, .extent = bsz * d
 
 var X_norm_tile: [bsz * dim_p_pe]f16 = @zeros([bsz * dim_p_pe]f16);
 var ptr_X_norm: [*]f16 = &X_norm_tile;
+// var X_norm_dsd = @get_dsd(mem1d_dsd, .{ .base_address = &X_norm_tile, .extent = bsz * dim_p_pe });
 
 var X_even_dsd = @get_dsd(mem1d_dsd, .{ .base_address = &dummy, .offset = 0, .extent = _dim_p_pe / 2, .stride = 2 });
 var X_odd_dsd = @get_dsd(mem1d_dsd, .{ .base_address = &dummy, .offset = 1, .extent = _dim_p_pe / 2, .stride = 2 });
@@ -271,6 +414,11 @@ var ptr_sum = &sum;
 var local_max: [bsz]f16 = @zeros([bsz]f16);
 var ptr_local_max: [*]f16 = &local_max;
 var local_max_dsd = @get_dsd(mem1d_dsd, .{ .base_address = &local_max, .extent = bsz });
+
+var local_max_g: [gqa_group_size * bsz]f16 = @zeros([gqa_group_size * bsz]f16);
+var local_max_g_dsd = @get_dsd(mem1d_dsd, .{ .base_address = &local_max_g, .extent = gqa_group_size * bsz });
+var local_sum_g: [gqa_group_size * bsz]f16 = @zeros([gqa_group_size * bsz]f16);
+var local_sum_g_dsd = @get_dsd(mem1d_dsd, .{ .base_address = &local_sum_g, .extent = gqa_group_size * bsz });
 
 var max: f16 = 0.0;
 var ptr_max = &max;
@@ -291,22 +439,47 @@ var X_tmp_4: [_dim_p_pe / 2]f16 = @zeros([_dim_p_pe / 2]f16);
 var ptr_X_tmp_4: [*]f16 = &X_tmp_4;
 var X_tmp_4_dsd = @get_dsd(mem1d_dsd, .{ .base_address = &X_tmp_4, .extent = _dim_p_pe / 2 });
 
-// * XQKV: Q, K, V are fused into one contiguous QKV_tile so a single
-// * all-reduce can cover all three projections (offsets 0 / bsz*dim_p_pe / 2*bsz*dim_p_pe).
-var QKV_tile: [bsz*3*dim_p_pe]f16 = @zeros([bsz*3*dim_p_pe]f16);
+// * XQKV: QKV in decoding
+// * middle result
+// var Q_tile: [bsz * dim_p_pe]f16 = @zeros([bsz * dim_p_pe]f16);
+// var ptr_Q: [*]f16 = &Q_tile;
+// var Q_dsd = @get_dsd(mem1d_dsd, .{ .base_address = &Q_tile, .extent = bsz * dim_p_pe });
+
+// var K_tile: [bsz * dim_p_pe]f16 = @zeros([bsz * dim_p_pe]f16);
+// var ptr_K: [*]f16 = &K_tile;
+// var K_dsd = @get_dsd(mem1d_dsd, .{ .base_address = &K_tile, .extent = bsz * dim_p_pe });
+
+// var V_tile: [bsz * dim_p_pe]f16 = @zeros([bsz * dim_p_pe]f16);
+// var ptr_V: [*]f16 = &V_tile;
+// var V_dsd = @get_dsd(mem1d_dsd, .{ .base_address = &V_tile, .extent = bsz * dim_p_pe });
+
+var QKV_tile: [bsz*(dim_p_pe + 2*kv_dim_p_pe)]f16 = @zeros([bsz*(dim_p_pe + 2*kv_dim_p_pe)]f16);
 var ptr_QKV_tile: [*]f16 = &QKV_tile;
 
+// Validation snapshots: captured at two points inside decode_struct()
+var QKV_post_proj:   [bsz*(dim_p_pe + 2*kv_dim_p_pe)]f16 = @zeros([bsz*(dim_p_pe + 2*kv_dim_p_pe)]f16);
+var ptr_QKV_post_proj: [*]f16 = &QKV_post_proj;
+var QKV_post_reduce: [bsz*(dim_p_pe + 2*kv_dim_p_pe)]f16 = @zeros([bsz*(dim_p_pe + 2*kv_dim_p_pe)]f16);
+var ptr_QKV_post_reduce: [*]f16 = &QKV_post_reduce;
+
 var Q_dsd = @get_dsd(mem1d_dsd, .{ .base_address = &QKV_tile, .offset = 0, .extent = bsz*dim_p_pe });
-var K_dsd = @get_dsd(mem1d_dsd, .{ .base_address = &QKV_tile, .offset = bsz*dim_p_pe, .extent = bsz*dim_p_pe });
-var V_dsd = @get_dsd(mem1d_dsd, .{ .base_address = &QKV_tile, .offset = 2*bsz*dim_p_pe, .extent = bsz*dim_p_pe });
+var K_dsd = @get_dsd(mem1d_dsd, .{ .base_address = &QKV_tile, .offset = bsz*dim_p_pe, .extent = bsz*kv_dim_p_pe });
+var V_dsd = @get_dsd(mem1d_dsd, .{ .base_address = &QKV_tile, .offset = bsz*(dim_p_pe + kv_dim_p_pe), .extent = bsz*kv_dim_p_pe });
 
-var score: [bsz * seq_len_p_pe]f16 = @zeros([bsz * seq_len_p_pe]f16);
+var score: [gqa_group_size * bsz * max_seq_len_p_pe]f16 = @zeros([gqa_group_size * bsz * max_seq_len_p_pe]f16);
 var ptr_score: [*]f16 = &score;
-var score_dsd = @get_dsd(mem1d_dsd, .{ .base_address = &score, .extent = bsz * seq_len_p_pe });
+var score_dsd = @get_dsd(mem1d_dsd, .{ .base_address = &score, .extent = bsz * max_seq_len_p_pe });
 
-var score_tmp: [bsz * seq_len_p_pe]f16 = @zeros([bsz * seq_len_p_pe]f16);
+var score_tmp: [bsz * max_seq_len_p_pe]f16 = @zeros([bsz * max_seq_len_p_pe]f16);
 var ptr_score_tmp: [*]f16 = &score_tmp;
-var score_tmp_dsd = @get_dsd(mem1d_dsd, .{ .base_address = &score_tmp, .extent = bsz * seq_len_p_pe });
+var score_tmp_dsd = @get_dsd(mem1d_dsd, .{ .base_address = &score_tmp, .extent = bsz * max_seq_len_p_pe });
+
+var score_post_gemv:   [gqa_group_size * bsz * max_seq_len_p_pe]f16 = @zeros([gqa_group_size * bsz * max_seq_len_p_pe]f16);
+var ptr_score_post_gemv: [*]f16 = &score_post_gemv;
+var score_post_gemv_dsd = @get_dsd(mem1d_dsd, .{ .base_address = &score_post_gemv, .extent = gqa_group_size * bsz * max_seq_len_p_pe });
+
+var score_post_reduce: [gqa_group_size * bsz * max_seq_len_p_pe]f16 = @zeros([gqa_group_size * bsz * max_seq_len_p_pe]f16);
+var ptr_score_post_reduce: [*]f16 = &score_post_reduce;
 
 var output_tile: [bsz * dim_p_pe]f16 = @zeros([bsz * dim_p_pe]f16);
 var ptr_output: [*]f16 = &output_tile;
@@ -320,8 +493,14 @@ var h2_tile: [bsz * dim_p_pe]f16 = @zeros([bsz * dim_p_pe]f16);
 var ptr_h2: [*]f16 = &h2_tile;
 var h2_dsd = @get_dsd(mem1d_dsd, .{ .base_address = &h2_tile, .extent = bsz * dim_p_pe });
 
-// UP (z1) and GATE (z2) projections are fused into one contiguous ZZ_tile so a
-// single all-reduce covers both (offsets 0 / bsz*ffn_dim_p_pe).
+// var z1_tile: [bsz * ffn_dim_p_pe]f16 = @zeros([bsz * ffn_dim_p_pe]f16);
+// var ptr_z1: [*]f16 = &z1_tile;
+// var z1_dsd = @get_dsd(mem1d_dsd, .{ .base_address = &z1_tile, .extent = bsz * ffn_dim_p_pe });
+
+// var z2_tile: [bsz * ffn_dim_p_pe]f16 = @zeros([bsz * ffn_dim_p_pe]f16);
+// var ptr_z2: [*]f16 = &z2_tile;
+// var z2_dsd = @get_dsd(mem1d_dsd, .{ .base_address = &z2_tile, .extent = bsz * ffn_dim_p_pe });
+
 var ZZ_tile: [bsz * 2 * ffn_dim_p_pe]f16 = @zeros([bsz * 2 * ffn_dim_p_pe]f16);
 var ptr_ZZ_tile: [*]f16 = &ZZ_tile;
 
@@ -339,6 +518,8 @@ var z_norm_dsd = @get_dsd(mem1d_dsd, .{ .base_address = &z_norm_tile, .extent = 
 var Z_tile: [bsz * dim_p_pe]f16 = @zeros([bsz * dim_p_pe]f16);
 var ptr_Z: [*]f16 = &Z_tile;
 var Z_dsd = @get_dsd(mem1d_dsd, .{ .base_address = &Z_tile, .extent = bsz * dim_p_pe });
+
+var ptr_debug: [*]f16 = &X_tile;
 
 
 // -------------------------------------------------------------------------- //
@@ -379,22 +560,25 @@ fn rmsnorm_x() void {
 fn xq_matvec_mult() void {
     @fmovh(Q_dsd, 0.0);
 
-    left_vector_dsd = @set_dsd_base_addr(left_vector_dsd, ptr_X_norm);
+    left_vector_dsd = @set_dsd_base_addr(left_vector_dsd, ptr_X); // ptr_X_norm);
 
     ptr_right_matrix = &Q_weight_tile;
 
+    // out_vector_dsd = @set_dsd_base_addr(out_vector_dsd, ptr_Q);
     out_vector_dsd = @set_dsd_base_addr(out_vector_dsd, ptr_QKV_tile);
 
     Kt = dim_p_pe;
     Nt = dim_p_pe;
 
     vecmat_computation();
+
+    // comm_mod.all_reduce_bsz_dim(py, quotient_y, remainder_y, ptr_Q);
 }
 
 fn xk_matvec_mult() void {
     @fmovh(K_dsd, 0.0);
 
-    left_vector_dsd = @set_dsd_base_addr(left_vector_dsd, ptr_X_norm);
+    left_vector_dsd = @set_dsd_base_addr(left_vector_dsd, ptr_X); // ptr_X_norm);
 
     ptr_right_matrix = &K_weight_tile;
 
@@ -402,7 +586,7 @@ fn xk_matvec_mult() void {
     out_vector_dsd = @increment_dsd_offset(out_vector_dsd, bsz*dim_p_pe, f16);
 
     Kt = dim_p_pe;
-    Nt = dim_p_pe;
+    Nt = kv_dim_p_pe;
 
     vecmat_computation();
 }
@@ -410,15 +594,15 @@ fn xk_matvec_mult() void {
 fn xv_matvec_mult() void {
     @fmovh(V_dsd, 0.0);
 
-    left_vector_dsd = @set_dsd_base_addr(left_vector_dsd, ptr_X_norm);
+    left_vector_dsd = @set_dsd_base_addr(left_vector_dsd, ptr_X); // ptr_X_norm);
 
     ptr_right_matrix = &V_weight_tile;
 
     out_vector_dsd = @set_dsd_base_addr(out_vector_dsd, ptr_QKV_tile);
-    out_vector_dsd = @increment_dsd_offset(out_vector_dsd, 2*bsz*dim_p_pe, f16);
+    out_vector_dsd = @increment_dsd_offset(out_vector_dsd, bsz*(dim_p_pe + kv_dim_p_pe), f16);
 
     Kt = dim_p_pe;
-    Nt = dim_p_pe;
+    Nt = kv_dim_p_pe;
 
     vecmat_computation();
 }
@@ -508,77 +692,223 @@ fn xk_rope() void {
 }
 
 fn score_matvec_mult() void {
+    // Zero full max-capacity score buffer, then use iter_num-length GEMVs.
+    score_dsd = @set_dsd_length(score_dsd, @bitcast(u16, gqa_group_size * bsz * max_seq_len_p_pe));
+    score_dsd = @set_dsd_base_addr(score_dsd, ptr_score);
     @fmovh(score_dsd, 0.0);
 
-    left_vector_dsd = @set_dsd_base_addr(left_vector_dsd, ptr_QKV_tile);
-    
     ptr_right_matrix = &XKCache_tile;
+    Kt = kv_dim_p_pe;
+    Nt = iter_num;  // variable: grows as tokens accumulate
 
+    // ---- SCORE GEMV: Q[b,g] @ K^T → score[b,g] ----
+    //
+    // SCORE LAYOUT: BATCH-OUTER [bsz, gqa_group_size, iter_num]
+    //   memory: [b0_g0(Nt), b0_g1(Nt), ..., b1_g0(Nt), b1_g1(Nt), ...]
+    //   Total: bsz * gqa_group_size * iter_num packed elements.
+    //
+    // Q LAYOUT in QKV_tile (Option C): BATCH-OUTER, GROUP-INNER
+    //   [Q_b0_g0(kv_dim_p_pe), Q_b0_g1(kv_dim_p_pe), Q_b1_g0(kv_dim_p_pe), ...]
+    //   Since dim_p_pe = gqa_group_size * kv_dim_p_pe, this is contiguous:
+    //   just bsz * gqa_group_size sub-blocks of kv_dim_p_pe each = bsz * dim_p_pe total.
+    //
+    // K^T CACHE (BATCHED): XKCache_tile[bsz, kv_dim_p_pe, max_seq_len_p_pe]
+    //   Each batch has its own K cache section. All GQA groups within a batch share
+    //   the same K cache. Only first iter_num columns of each row are valid.
+    //
+    // GEMV structure: nested bsz × gqa_group_size loop.
+    //   Per batch: reset K to batch's cache base.
+    //   Per group within batch: reset K to same batch base (via decrement after inner).
+    //   Inner loop: kv_dim_p_pe scalar-broadcast multiply-accumulate steps
+    //     score[j] += Q[i] * K[i * max_seq_len_p_pe + j]  for j in 0..iter_num-1
+
+    left_vector_dsd = @set_dsd_length(left_vector_dsd, 1);
+    right_matrix_dsd = @set_dsd_length(right_matrix_dsd, @bitcast(u16, Nt));
+    out_vector_dsd = @set_dsd_length(out_vector_dsd, @bitcast(u16, Nt));
+
+    left_vector_dsd = @set_dsd_base_addr(left_vector_dsd, &QKV_tile);
     out_vector_dsd = @set_dsd_base_addr(out_vector_dsd, ptr_score);
+    right_matrix_dsd = @set_dsd_base_addr(right_matrix_dsd, ptr_right_matrix);
 
-    Kt = dim_p_pe;
-    Nt = seq_len_p_pe;
+    // BATCHED K CACHE: [bsz, kv_dim_p_pe, max_seq_len_p_pe]
+    // Each batch has its own K cache section, stride = kv_dim_p_pe * max_seq_len_p_pe.
+    // Within each batch, all gqa_group_size groups share the same K cache.
+    // right_matrix_dsd tracks the current batch's K cache base.
+    for (@range(i16, bsz)) |_| {
+        for (@range(i16, gqa_group_size)) |_| {
+            // right_matrix_dsd points to this batch's K cache base.
+            @load_to_dsr(dest_dsr_1, out_vector_dsd, .{ .save_address = false });
+            @load_to_dsr(src0_dsr_1, out_vector_dsd, .{ .save_address = false });
 
-    vecmat_computation();
+            // Inner loop: kv_dim_p_pe scalar-broadcast multiply-accumulate steps.
+            // Each step: score[:] += Q[i] * K_row_i[:iter_num]
+            for (@range(i16, Kt)) |_| {
+                @load_to_dsr(src1_dsr_1, right_matrix_dsd, .{ .save_address = false });
+                @map(gemv_static_step, left_vector_dsd);
+                left_vector_dsd = @increment_dsd_offset(left_vector_dsd, 1, f16);
+                right_matrix_dsd = @increment_dsd_offset(right_matrix_dsd, max_seq_len_p_pe, f16);
+            }
+            // After inner loop: right_matrix_dsd advanced by Kt * max_seq_len_p_pe
+            // = kv_dim_p_pe * max_seq_len_p_pe. Reset to this batch's base for next group.
+            right_matrix_dsd = @increment_dsd_offset(right_matrix_dsd, -kv_dim_p_pe * max_seq_len_p_pe, f16);
 
-    comm_mod.all_reduce_bsz_seq_len(px, quotient_x, remainder_x, ptr_score);
+            out_vector_dsd = @increment_dsd_offset(out_vector_dsd, Nt, f16);
+        }
+        // Advance to next batch's K cache section.
+        right_matrix_dsd = @increment_dsd_offset(right_matrix_dsd, kv_dim_p_pe * max_seq_len_p_pe, f16);
+    }
 
-    // score factor
+    // Snapshot 5a: copy full score buffer
+    for (@range(i16, gqa_group_size * bsz * max_seq_len_p_pe)) |i| { score_post_gemv[i] = score[i]; }
+
+    // Phase 2: ONE batched variable-length KV-head-scoped X-reduce over all groups
+    comm_mod.all_reduce_bsz_g_var_seq_len_kv_head_scoped(px_in_kv_head, quotient_x_in_kv_head, remainder_x, ptr_score, iter_num);
+
+    // Phase 3: alpha scale — flat over all bsz * gqa_group_size * iter_num elements.
+    // All elements share the same alpha = 1/sqrt(head_dim), so no per-group loop needed.
+    score_dsd = @set_dsd_length(score_dsd, @bitcast(u16, bsz * gqa_group_size * iter_num));
+    score_dsd = @set_dsd_base_addr(score_dsd, ptr_score);
     @load_to_dsr(dest_dsr_1, score_dsd);
     @load_to_dsr(src0_dsr_1, score_dsd);
     @fmulh(dest_dsr_1, src0_dsr_1, alpha);
+
+    score_dsd = @set_dsd_length(score_dsd, @bitcast(u16, bsz * iter_num * gqa_group_size));
+
+    // Snapshot 5b: copy full score buffer
+    for (@range(i16, gqa_group_size * bsz * max_seq_len_p_pe)) |i| { score_post_reduce[i] = score[i]; }
 }
 
-fn softmax_score() void {
+fn softmax_score_all_groups() void {
+    // Set iter_num length on the score-row DSDs used throughout this function.
+    max_seq_len_p_pe_dsd_1 = @set_dsd_length(max_seq_len_p_pe_dsd_1, @bitcast(u16, iter_num));
+    max_seq_len_p_pe_dsd_2 = @set_dsd_length(max_seq_len_p_pe_dsd_2, @bitcast(u16, iter_num));
 
-    seq_len_p_pe_dsd_1 = @set_dsd_base_addr(seq_len_p_pe_dsd_1, ptr_score);
-    @load_to_dsr(src1_dsr_1, seq_len_p_pe_dsd_1, .{ .save_address = true });
+    // Step 1: local max for each (b, g) pair → local_max_g[b*gqa_group_size + g]
+    // Score is BATCH-OUTER: [b0_g0, b0_g1, ..., b1_g0, b1_g1, ...]
+    // Load DSR ONCE — save_address=true auto-advances by iter_num per @fmaxh,
+    // sequentially reading all bsz*gqa_group_size sub-blocks in batch-outer order.
+    // TODO: WHY not .save_address = true
+    max_seq_len_p_pe_dsd_1 = @set_dsd_base_addr(max_seq_len_p_pe_dsd_1, ptr_score);
     for (@range(i16, bsz)) |b| {
-        max = 0.0;
-        @fmaxh(ptr_max, max, src1_dsr_1);
-        local_max[b] = max;
+        for (@range(i16, gqa_group_size)) |g| {
+            max = 0.0;
+            @load_to_dsr(src1_dsr_1, max_seq_len_p_pe_dsd_1, .{ .save_address = false });
+            @fmaxh(ptr_max, max, src1_dsr_1);
+            local_max_g[b * gqa_group_size + g] = max;
+            max_seq_len_p_pe_dsd_1 = @increment_dsd_offset(max_seq_len_p_pe_dsd_1, iter_num, f16);
+        }
     }
 
-    comm_mod.all_reduceMax_bsz(py, quotient_y, remainder_y, ptr_local_max);
+    // Step 2: ONE Y-reduce-max over gqa_group_size * bsz scalars
+    comm_mod.all_reduceMax_bsz_g(py, quotient_y, remainder_y, &local_max_g);
 
-    seq_len_p_pe_dsd_1 = @set_dsd_base_addr(seq_len_p_pe_dsd_1, ptr_score_tmp);
-    seq_len_p_pe_dsd_2 = @set_dsd_base_addr(seq_len_p_pe_dsd_2, ptr_score);
-    @load_to_dsr(dest_dsr_1, seq_len_p_pe_dsd_1, .{ .save_address = true });
-    @load_to_dsr(src0_dsr_1, seq_len_p_pe_dsd_2, .{ .save_address = true });
-    @map(fsubh_func, local_max_dsd);
+    // Step 3: subtract global max + apply exp → score in place.
+    // Processes bsz sub-blocks per outer iteration, gqa_group_size iterations total.
+    // score_tmp is sized [bsz * max_seq_len_p_pe] so chunk size = bsz * iter_num.
+    // Sequential access through local_max_g matches score's batch-outer order
+    // because Step 1 stored maxes in the same sequential order.
+    // Each iteration: (a) score_tmp = score_chunk - max_chunk, (b) score_chunk = exp(score_tmp).
+
+    max_seq_len_p_pe_dsd_1 = @set_dsd_length(max_seq_len_p_pe_dsd_1, @bitcast(u16, iter_num));
+    max_seq_len_p_pe_dsd_2 = @set_dsd_length(max_seq_len_p_pe_dsd_2, @bitcast(u16, iter_num));
+    score_tmp_dsd = @set_dsd_length(score_tmp_dsd, @bitcast(u16, bsz * iter_num * gqa_group_size));
+    score_dsd = @set_dsd_length(score_dsd, @bitcast(u16, bsz * iter_num * gqa_group_size));
+
+    max_seq_len_p_pe_dsd_1 = @set_dsd_base_addr(max_seq_len_p_pe_dsd_1, ptr_score_tmp);
+    max_seq_len_p_pe_dsd_2 = @set_dsd_base_addr(max_seq_len_p_pe_dsd_2, ptr_score);
+    
+    @load_to_dsr(dest_dsr_1, max_seq_len_p_pe_dsd_1, .{ .save_address = true });
+    @load_to_dsr(src0_dsr_1, max_seq_len_p_pe_dsd_2, .{ .save_address = true });
+    @map(fsubh_func, local_max_g_dsd);
 
     @map(fast_exp, score_tmp_dsd, score_dsd);
 
-    seq_len_p_pe_dsd_1 = @set_dsd_base_addr(seq_len_p_pe_dsd_1, ptr_score);
-    @load_to_dsr(src1_dsr_1, seq_len_p_pe_dsd_1, .{ .save_address = true });
+    score_dsd = @set_dsd_length(score_dsd, @bitcast(u16, bsz * max_seq_len_p_pe * gqa_group_size));
+    score_dsd = @set_dsd_base_addr(score_dsd, ptr_score);
+
+    // Step 4: local sum for each (b, g) pair → local_sum_g[b*gqa_group_size + g]
+    // Score is BATCH-OUTER: DSR reads gqa_group_size groups per batch.
+    // Load DSR once per batch (outside g loop), advance gqa_group_size times.
+    // TODO: WHY not .save_address = true
+    max_seq_len_p_pe_dsd_1 = @set_dsd_base_addr(max_seq_len_p_pe_dsd_1, ptr_score);
+    max_seq_len_p_pe_dsd_1 = @set_dsd_length(max_seq_len_p_pe_dsd_1, @bitcast(u16, iter_num));
     for (@range(i16, bsz)) |b| {
-        sum = 0.0;
-        @faddh(ptr_sum, sum, src1_dsr_1);
-        local_sum[b] = sum;
+        // @load_to_dsr(src1_dsr_1, max_seq_len_p_pe_dsd_1, .{ .save_address = true });
+        for (@range(i16, gqa_group_size)) |g| {
+            sum = 0.0;
+            @load_to_dsr(src1_dsr_1, max_seq_len_p_pe_dsd_1, .{ .save_address = false });
+            @faddh(ptr_sum, sum, src1_dsr_1);
+            local_sum_g[b * gqa_group_size + g] = sum;
+            max_seq_len_p_pe_dsd_1 = @increment_dsd_offset(max_seq_len_p_pe_dsd_1, iter_num, f16);
+        }
+        // max_seq_len_p_pe_dsd_1 = @increment_dsd_offset(max_seq_len_p_pe_dsd_1, gqa_group_size * iter_num, f16);
     }
 
-    comm_mod.all_reduce_bsz(py, quotient_y, remainder_y, ptr_local_sum);
+    // Step 5: ONE Y-reduce-sum over gqa_group_size * bsz scalars
+    comm_mod.all_reduce_bsz_g(py, quotient_y, remainder_y, &local_sum_g);
 
-    seq_len_p_pe_dsd_1 = @set_dsd_base_addr(seq_len_p_pe_dsd_1, ptr_score);
-    @load_to_dsr(dest_dsr_1, seq_len_p_pe_dsd_1, .{ .save_address = true });
-    @load_to_dsr(src0_dsr_1, seq_len_p_pe_dsd_1, .{ .save_address = true });
-    @map(fmulh_softmax_func, local_sum_dsd);
+    // Step 6: divide each score sub-block by its global sum.
+    // Processes bsz sub-blocks per outer iteration, gqa_group_size iterations total.
+    // Sequential access through local_sum_g matches score's batch-outer order
+    // because Step 4 stored sums in the same sequential order.
+    // save_address=true so DSR advances by iter_num per fmulh_softmax_func call.
+
+    max_seq_len_p_pe_dsd_1 = @set_dsd_base_addr(max_seq_len_p_pe_dsd_1, ptr_score);
+    @load_to_dsr(dest_dsr_1, max_seq_len_p_pe_dsd_1, .{ .save_address = true });
+    @load_to_dsr(src0_dsr_1, max_seq_len_p_pe_dsd_1, .{ .save_address = true });
+    @map(fmulh_softmax_func, local_sum_g_dsd);
+
+    // Restore local_max_dsd and local_sum_dsd base addresses for other callers
+    local_max_g_dsd = @set_dsd_base_addr(local_max_g_dsd, &local_max_g);
+    local_sum_g_dsd = @set_dsd_base_addr(local_sum_g_dsd, &local_sum_g);
+
 }
 
-fn output_matvec_mult() void {
-    @fmovh(output_dsd, 0.0);
+fn output_matvec_mult_all_groups() void {
+    // Output GEMV: attn[b,g] @ V → output[b,g] for all (b,g) pairs.
+    //
+    // Score layout (batch-outer): [b0_g0(iter_num), b0_g1(iter_num), ...]
+    //   = bsz * gqa_group_size packed sub-blocks of iter_num each.
+    //
+    // V CACHE (BATCHED): XVCache_tile[bsz, max_seq_len_p_pe, kv_dim_p_pe]
+    //   Each batch has its own V cache section, stride = max_seq_len_p_pe * kv_dim_p_pe.
+    //   Within each batch, all gqa_group_size groups share the same V.
+    //   right_matrix_dsd is NOT modified by @load_to_dsr (only DSR advances),
+    //   so it naturally stays at this batch's V base for all groups.
+    //
+    // Output layout: [out_b0_g0(kv_dim_p_pe), out_b0_g1(kv_dim_p_pe), ...]
+    //   = batch-outer, group-inner (matches Q layout for subsequent O-projection).
 
     left_vector_dsd = @set_dsd_base_addr(left_vector_dsd, ptr_score);
-    
-    ptr_right_matrix = &XVCache_tile;
-
     out_vector_dsd = @set_dsd_base_addr(out_vector_dsd, ptr_output);
+    ptr_right_matrix = &XVCache_tile;
+    Kt = iter_num;  // variable: current sequence length
+    Nt = kv_dim_p_pe;
 
-    Kt = seq_len_p_pe;
-    Nt = dim_p_pe;
+    left_vector_dsd = @set_dsd_length(left_vector_dsd, @bitcast(u16, Kt));
+    right_matrix_dsd = @set_dsd_length(right_matrix_dsd, @bitcast(u16, Nt));
+    out_vector_dsd = @set_dsd_length(out_vector_dsd, @bitcast(u16, Nt));
+    right_matrix_dsd = @set_dsd_base_addr(right_matrix_dsd, ptr_right_matrix);
 
-    vecmat_computation();
+    for (@range(i16, bsz)) |_| {
+        for (@range(i16, gqa_group_size)) |_| {
+            // right_matrix_dsd points to this batch's V base.
+            // @load_to_dsr does NOT modify right_matrix_dsd (only DSR advances via save_address),
+            // so all groups within the same batch re-read the same V cache.
+            @load_to_dsr(dest_dsr_1, out_vector_dsd, .{ .save_address = false });
+            @load_to_dsr(src0_dsr_1, out_vector_dsd, .{ .save_address = false });
+            @load_to_dsr(src1_dsr_1, right_matrix_dsd, .{ .save_address = true });
 
+            @map(gemv_static_step, left_vector_dsd);
+
+            left_vector_dsd = @increment_dsd_offset(left_vector_dsd, Kt, f16);
+            out_vector_dsd = @increment_dsd_offset(out_vector_dsd, Nt, f16);
+        }
+        // Advance to next batch's V cache section.
+        right_matrix_dsd = @increment_dsd_offset(right_matrix_dsd, max_seq_len_p_pe * kv_dim_p_pe, f16);
+    }
+
+    // Single Y-reduce covers all gqa_group_size sub-head outputs (full output_tile)
     comm_mod.all_reduce_bsz_dim(py, quotient_y, remainder_y, ptr_output);
 }
 
@@ -631,9 +961,9 @@ fn rmsnorm_z() void {
         @fmulh(dest_dsr_1, src0_dsr_1, src1_dsr_1);
     }
 
-    seq_len_p_pe_dsd_1 = @set_dsd_base_addr(seq_len_p_pe_dsd_1, ptr_z_norm);
-    @load_to_dsr(dest_dsr_1, seq_len_p_pe_dsd_1, .{ .save_address = true });
-    @load_to_dsr(src0_dsr_1, seq_len_p_pe_dsd_1, .{ .save_address = true });
+    max_seq_len_p_pe_dsd_1 = @set_dsd_base_addr(max_seq_len_p_pe_dsd_1, ptr_z_norm);
+    @load_to_dsr(dest_dsr_1, max_seq_len_p_pe_dsd_1, .{ .save_address = true });
+    @load_to_dsr(src0_dsr_1, max_seq_len_p_pe_dsd_1, .{ .save_address = true });
     @map(fmulh_norm_func, local_sum_dsd);
 }
 
@@ -644,12 +974,15 @@ fn up_matvec_mult() void {
     
     ptr_right_matrix = &UP_weight_tile;
 
+    // out_vector_dsd = @set_dsd_base_addr(out_vector_dsd, ptr_z1);
     out_vector_dsd = @set_dsd_base_addr(out_vector_dsd, ptr_ZZ_tile);
 
     Kt = dim_p_pe;
     Nt = ffn_dim_p_pe;
 
     vecmat_computation();
+
+    // comm_mod.all_reduce_bsz_ffn_dim(py, quotient_y, remainder_y, ptr_z1);
 }
 
 fn gate_matvec_mult() void {
@@ -659,6 +992,7 @@ fn gate_matvec_mult() void {
     
     ptr_right_matrix = &GATE_weight_tile;
 
+    // out_vector_dsd = @set_dsd_base_addr(out_vector_dsd, ptr_z2);
     out_vector_dsd = @set_dsd_base_addr(out_vector_dsd, ptr_ZZ_tile);
     out_vector_dsd = @increment_dsd_offset(out_vector_dsd, bsz * ffn_dim_p_pe, f16);
 
@@ -666,17 +1000,21 @@ fn gate_matvec_mult() void {
     Nt = ffn_dim_p_pe;
 
     vecmat_computation();
+
+    // comm_mod.all_reduce_bsz_ffn_dim(py, quotient_y, remainder_y, ptr_z2);
+}
+
+fn silu_kernel(val: f16) f16 {
+    return val / (1.0 + fast_exp(-val));
 }
 
 var z2_val: f16 = 0.0;
 fn z2_silu() void {
-    // SiLU is applied to the GATE projection (z2), which lives at offset
-    // bsz*ffn_dim_p_pe in ZZ_tile and spans bsz*ffn_dim_p_pe elements.
-    const z2_base: i16 = bsz * ffn_dim_p_pe;
-    for (@range(i16, bsz * ffn_dim_p_pe)) |i| {
-        z2_val = ZZ_tile[z2_base + i];
-        ZZ_tile[z2_base + i] = z2_val / (1.0 + fast_exp(-z2_val));
+    for (@range(i16, bsz*dim_p_pe)) |i| {
+        z2_val = ZZ_tile[i];
+        ZZ_tile[i] = z2_val / (1.0 + fast_exp(-z2_val));
     }
+    // @map(silu_kernel, z2_dsd, z2_dsd);
 }
 
 fn z3_mat() void {
@@ -717,21 +1055,29 @@ fn decode_struct() void {
     xq_matvec_mult();
     xk_matvec_mult();
     xv_matvec_mult();
+    // Snapshot 1: local partial GEMV result (before Y-reduce)
+    for (@range(i16, bsz * (dim_p_pe + 2 * kv_dim_p_pe))) |i| { QKV_post_proj[i] = QKV_tile[i]; }
+
     comm_mod.all_reduce_bsz_dim_QKV_fusion(py, quotient_y, remainder_y, ptr_QKV_tile);
+    // Snapshot 2: after Y-reduce, before RoPE
+    for (@range(i16, bsz * (dim_p_pe + 2 * kv_dim_p_pe))) |i| { QKV_post_reduce[i] = QKV_tile[i]; }
 
-    comm_mod.reconfig_allreduce_axis(0); // 0: px row-wise, 1: py col-wise
+    comm_mod.reconfig_allreduce_axis(3); // 3: kv-head-scoped X (pes_p_kv_head PEs per KV-head)
 
-    xq_rope();
-    xk_rope();
+    // xq_rope();  // TODO: RoPE disabled — strided-DSD @fmulh bug under investigation
+    // xk_rope();
 
-    score_matvec_mult();
+    process_kv();  // write K,V to on-chip cache at iter_num (only py == step % P writes)
+
+    score_matvec_mult();  // gqa_group_size GEMVs + kv-head-scoped reduces inside
 
     comm_mod.reconfig_allreduce_axis(1);
 
-    softmax_score();
+    @fmovh(output_dsd, 0.0);
+    softmax_score_all_groups();       // 2 Y-reduces total (1 max + 1 sum), batched over all groups
 
-    output_matvec_mult();
-
+    output_matvec_mult_all_groups();  // G local GEMVs, no sync
+    
     comm_mod.reconfig_allreduce_axis(0);
 
     o_matvec_mult();
@@ -757,6 +1103,8 @@ fn decode_struct() void {
     ffn_residual_add();
 
     comm_mod.reconfig_allreduce_axis(1);
+
+    step += 1;
 
     decode_entry();
 }
@@ -865,4 +1213,16 @@ comptime {
 comptime {
     @export_symbol(ptr_timer_buf, "timer_buf");
     @export_symbol(ptr_time_ref, "time_ref");
+    @export_symbol(ptr_debug, "debug");
+}
+
+comptime {
+    // Intermediate buffers exported for host-side validation
+    @export_symbol(ptr_QKV_post_proj,   "QKV_post_proj");     // after projection, before Y-reduce
+    @export_symbol(ptr_QKV_post_reduce, "QKV_post_reduce");   // after Y-reduce, before RoPE
+    @export_symbol(ptr_QKV_tile, "QKV_tile");                 // post-RoPE Q/K/V  [bsz*(dim_p_pe+2*kv_dim_p_pe)]
+    @export_symbol(ptr_score_post_gemv,   "score_post_gemv"); // after GEMV, before head reduce [bsz*max_seq_len_p_pe]
+    @export_symbol(ptr_score_post_reduce, "score_post_reduce"); // after reduce+alpha, before softmax [bsz*max_seq_len_p_pe]
+    @export_symbol(ptr_score, "score");                       // post-softmax attn [bsz*max_seq_len_p_pe]
+    @export_symbol(ptr_output, "output_tile");                // post-output-matmul [bsz*dim_p_pe]
 }

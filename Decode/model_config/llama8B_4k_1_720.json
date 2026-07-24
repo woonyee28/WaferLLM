@@ -1,0 +1,13 @@
+{
+    "P": 720,
+    "group_num": 32,
+    "bsz": 1,
+    "dim": 4320,
+    "n_heads": 32,
+    "n_kv_heads": 8,
+    "head_dim": 135,
+    "max_seq_len": 14400,
+    "prefill_len": 4320,
+    "ffn_dim": 14400,
+    "layer_num": 32
+}

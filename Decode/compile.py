@@ -1,75 +1,76 @@
-"""Unified compile entry for Decode (config-driven).
-
-  --mode sim     : local `cslc` build into out_<cfg>/
-  --mode device  : cloud SdkCompiler build -> compile_out/artifact_<cfg>.json
-
-<cfg> is the config-file basename, so concurrent configs never collide.
-"""
-import argparse
-import json
 import os
-import subprocess
+import sys
+import json
 import time
-
-
-def derive_params(cj):
-    P = cj["P"]
-    G = cj["group_num"]
-    d = {
-        "P": P,
-        "bsz": cj["bsz"],
-        "dim_p_pe": cj["dim"] // P,
-        "pes_p_head": P // cj["n_heads"],
-        "pes_p_kv_head": P // cj["n_kv_heads"],
-        "head_dim_p_pe": cj["head_dim"] // P,
-        "seq_len_p_pe": cj["seq_len"] // P,
-        "ffn_dim_p_pe": cj["ffn_dim"] // P,
-        "pe_num_p_group": P // G,
-    }
-    d["root_1st_phase"] = d["pe_num_p_group"] // 2
-    d["root_2nd_phase"] = (G // 2) * d["pe_num_p_group"] + d["root_1st_phase"]
-    return d
-
+import subprocess
 
 def main():
-    ap = argparse.ArgumentParser(description="Compile Decode (WSE-3, SDK 2.10)")
-    ap.add_argument("--mode", choices=["sim", "device"], required=True)
-    ap.add_argument("--config", required=True)
-    args = ap.parse_args()
+    if len(sys.argv) < 2:
+        print("Usage: python compile.py <config.json> [simulator=false]", file=sys.stderr)
+        sys.exit(1)
 
-    cfg_name = os.path.splitext(os.path.basename(args.config))[0]
-    with open(args.config, encoding="utf-8") as f:
-        cj = json.load(f)
-    d = derive_params(cj)
-    P = d["P"]
-    params = ",".join(f"{k}:{v}" for k, v in d.items())
+    config_path = sys.argv[1]
+    simulator = sys.argv[2].lower() == "true" if len(sys.argv) > 2 else False
 
-    print("Start compiling: " + time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(time.time())), flush=True)
+    with open(config_path, "r", encoding="utf8") as f:
+        config = json.load(f)
 
-    if args.mode == "sim":
-        out_dir = f"out_{cfg_name}"
-        subprocess.run(["rm", "-rf", out_dir], check=True)
-        cmd = [
-            "cslc", "--arch=wse3", "./src/layout.csl",
-            f"--fabric-dims={P + 7},{P + 2}", "--fabric-offsets=4,1",
-            f"--params={params}", "-o", out_dir, "--memcpy", "--channels", "1",
-        ]
-        subprocess.run(cmd, check=True)
+    P = config["P"]
+    bsz = config["bsz"]
+    group_num = config["group_num"]
+    dim = config["dim"]
+    n_heads = config["n_heads"]
+    n_kv_heads = config["n_kv_heads"]
+    head_dim = config["head_dim"]
+    max_seq_len = config["max_seq_len"]
+    prefill_len = config["prefill_len"]
+    ffn_dim = config["ffn_dim"]
+
+    dim_p_pe = dim // P
+    kv_dim_p_pe = (n_kv_heads * head_dim) // P
+    pes_p_head = P // n_heads
+    pes_p_kv_head = P // n_kv_heads
+    head_dim_p_pe = head_dim // P
+    max_seq_len_p_pe = max_seq_len // P
+    prefill_len_p_pe = prefill_len // P
+    ffn_dim_p_pe = ffn_dim // P
+    pe_num_p_group = P // group_num
+    root_1st_phase = pe_num_p_group // 2
+    root_2nd_phase = (group_num // 2) * pe_num_p_group + root_1st_phase
+
+    if simulator:
+        fabric_w = P + 7
+        fabric_h = P + 2
+        channels = 1
     else:
-        from cerebras.sdk.client import SdkCompiler
-        os.makedirs("compile_out", exist_ok=True)
-        options = (
-            f"--arch=wse3 --fabric-dims=762,1172 --fabric-offsets=4,1 "
-            f"-o out --memcpy --channels=4 --params={params}"
-        )
-        with SdkCompiler(resource_cpu=48000, resource_mem=64 << 30, disable_version_check=True) as compiler:
-            artifact_id = compiler.compile(
-                app_path="src", csl_main="layout.csl", options=options, out_path="compile_out",
-            )
-        with open(f"compile_out/artifact_{cfg_name}.json", "w", encoding="utf-8") as f:
-            json.dump({"artifact_id": artifact_id}, f)
+        fabric_w = 762
+        fabric_h = 1172
+        channels = 4
 
-    print("End compiling: " + time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(time.time())), flush=True)
+    params = (
+        f"P:{P},bsz:{bsz},"
+        f"dim_p_pe:{dim_p_pe},kv_dim_p_pe:{kv_dim_p_pe},"
+        f"pes_p_head:{pes_p_head},pes_p_kv_head:{pes_p_kv_head},"
+        f"head_dim_p_pe:{head_dim_p_pe},head_dim:{head_dim},"
+        f"max_seq_len_p_pe:{max_seq_len_p_pe},prefill_len_p_pe:{prefill_len_p_pe},"
+        f"ffn_dim_p_pe:{ffn_dim_p_pe},"
+        f"pe_num_p_group:{pe_num_p_group},"
+        f"root_1st_phase:{root_1st_phase},root_2nd_phase:{root_2nd_phase}"
+    )
+
+    cmd = (
+        f"cslc --arch=wse3 ./src/layout.csl "
+        f"--fabric-dims={fabric_w},{fabric_h} --fabric-offsets=4,1 "
+        f"--params={params} "
+        f"-o out --memcpy --channels {channels}"
+    )
+
+    print(f"Start compiling: {time.strftime('%Y-%m-%d %H:%M:%S')}", flush=True)
+    print(f"Command: {cmd}", flush=True)
+
+    result = subprocess.run(cmd, shell=True, check=True)
+
+    print(f"End compiling: {time.strftime('%Y-%m-%d %H:%M:%S')}", flush=True)
 
 
 if __name__ == "__main__":

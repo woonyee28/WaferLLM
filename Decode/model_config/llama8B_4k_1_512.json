@@ -1,12 +1,12 @@
 {
-    "P": 256,
+    "P": 512,
     "group_num": 32,
     "bsz": 1,
     "dim": 4096,
     "n_heads": 32,
     "n_kv_heads": 8,
     "head_dim": 128,
-    "max_seq_len": 5120,
+    "max_seq_len": 10240,
     "prefill_len": 4096,
     "ffn_dim": 14336,
     "layer_num": 32

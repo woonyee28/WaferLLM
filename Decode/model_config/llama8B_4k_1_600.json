@@ -1,0 +1,13 @@
+{
+    "P": 600,
+    "group_num": 40,
+    "bsz": 1,
+    "dim": 4200,
+    "n_heads": 40,
+    "n_kv_heads": 10,
+    "head_dim": 105,
+    "max_seq_len": 12000,
+    "prefill_len": 4200,
+    "ffn_dim": 14400,
+    "layer_num": 32
+}
