@@ -1079,8 +1079,8 @@ fn decode_struct() void {
 
     comm_mod.reconfig_allreduce_axis(3); // 3: kv-head-scoped X (pes_p_kv_head PEs per KV-head)
 
-    // xq_rope();  // TODO: RoPE disabled — strided-DSD @fmulh bug under investigation
-    // xk_rope();
+    xq_rope();   // RoPE enabled. Local strided pairs; correct when kv_dim_p_pe>=2 (e.g. mha_test).
+    xk_rope();   // At kv_dim_p_pe==1 a K pair straddles 2 PEs -> needs a nearest-neighbour exchange (TODO).
 
     process_kv();  // write K,V to on-chip cache at iter_num (only py == step % P writes)
 

@@ -86,9 +86,9 @@ def compute_reference(X, W_norm, W_Q_perm, W_K, W_V, freqs_cos, freqs_sin,
     K_new = (X_norm.astype(np.float32) @ W_K.astype(np.float32)).astype(np.float16)         # [bsz, kv_dim]
     V_new = (X_norm.astype(np.float32) @ W_V.astype(np.float32)).astype(np.float16)         # [bsz, kv_dim]
 
-    # Step 3: RoPE disabled
-    Q_rope = Q_perm
-    K_rope = K_new
+    # Step 3: RoPE — Q rotates over the full dim, K over the first kv_dim//2 freqs.
+    Q_rope = rope_csl(Q_perm, freqs_cos, freqs_sin)
+    K_rope = rope_csl(K_new, freqs_cos[:kv_dim // 2], freqs_sin[:kv_dim // 2])
 
     # After total_steps decode steps:
     # PE py receives writes at decode steps {py, py+P, py+2P, ...}.
@@ -105,7 +105,7 @@ def compute_reference(X, W_norm, W_Q_perm, W_K, W_V, freqs_cos, freqs_sin,
     K_ext[:, :, :prefill_len] = XKCache[:, :, :prefill_len].astype(np.float32)
     for s in range(total_steps):
         for b in range(bsz):
-            K_ext[b, :, prefill_len + s] = K_new[b, :].astype(np.float32)
+            K_ext[b, :, prefill_len + s] = K_rope[b, :].astype(np.float32)
 
     V_ext = np.zeros((bsz, seq_len, kv_dim), dtype=np.float32)
     V_ext[:, :prefill_len, :] = XVCache[:, :prefill_len, :].astype(np.float32)
@@ -122,7 +122,7 @@ def compute_reference(X, W_norm, W_Q_perm, W_K, W_V, freqs_cos, freqs_sin,
         for s in range(pes_p_kv_head):
             px = kv_head * pes_p_kv_head + s
             col_start = px * dim_p_pe + g * kv_dim_p_pe
-            Q_h[:, s * kv_dim_p_pe:(s + 1) * kv_dim_p_pe] = Q_perm[:, col_start:col_start + kv_dim_p_pe].astype(np.float32)
+            Q_h[:, s * kv_dim_p_pe:(s + 1) * kv_dim_p_pe] = Q_rope[:, col_start:col_start + kv_dim_p_pe].astype(np.float32)
         for b in range(bsz):
             K_kv_b = K_ext[b, kv_head * head_dim:(kv_head + 1) * head_dim, :]  # [head_dim, seq_len]
             score_per_head[h, b, :] = Q_h[b:b+1, :] @ K_kv_b
