@@ -11,26 +11,26 @@ param pe_num_p_group: i16;
 param root_1st_phase: i16;
 param root_2nd_phase: i16;
 
-param X_1st_RD_0: comptime_struct;
-param X_1st_RD_1: comptime_struct;
-param Y_1st_RD_0: comptime_struct;
-param Y_1st_RD_1: comptime_struct;
+param X_1st_RD_0;
+param X_1st_RD_1;
+param Y_1st_RD_0;
+param Y_1st_RD_1;
 
-param X_2nd_RD_0: comptime_struct;
-param X_2nd_RD_1: comptime_struct;
-param Y_2nd_RD_0: comptime_struct;
-param Y_2nd_RD_1: comptime_struct;
+param X_2nd_RD_0;
+param X_2nd_RD_1;
+param Y_2nd_RD_0;
+param Y_2nd_RD_1;
 
-param X_HEAD_2nd_RD_0: comptime_struct;
-param X_HEAD_2nd_RD_1: comptime_struct;
-param X_HEAD_BD: comptime_struct;
+param X_HEAD_2nd_RD_0;
+param X_HEAD_2nd_RD_1;
+param X_HEAD_BD;
 
-param X_KV_HEAD_2nd_RD_0: comptime_struct;
-param X_KV_HEAD_2nd_RD_1: comptime_struct;
-param X_KV_HEAD_BD: comptime_struct;
+param X_KV_HEAD_2nd_RD_0;
+param X_KV_HEAD_2nd_RD_1;
+param X_KV_HEAD_BD;
 
-param X_BD: comptime_struct;
-param Y_BD: comptime_struct;
+param X_BD;
+param Y_BD;
 
 param reduce_1st_color_0: color;
 param reduce_1st_color_1: color;

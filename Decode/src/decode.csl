@@ -1,5 +1,5 @@
-param memcpy_params: comptime_struct;
-param comm_params: comptime_struct;
+param memcpy_params;
+param comm_params;
 
 // -------------------------------------------------------------------------- //
 // ---------------------------- Model Parameters ---------------------------- //
@@ -25,29 +25,8 @@ param pe_num_p_group: i16;
 param root_1st_phase: i16;
 param root_2nd_phase: i16;
 
-const trace = @import_module(
-  "<debug>",
-  .{ .key = "debug_main",
-     .buffer_size = 100,
-   }
-);
-const simprint = @import_module("<simprint>");
-
-fn simprint_pe_coords_dsd( dsd : mem1d_dsd) void {
-  simprint.print_string("PE : ");
-  simprint.print_string("(");
-  simprint.print_u16_decimal(@as(u16, px));
-  simprint.print_string(",");
-  simprint.print_u16_decimal(@as(u16, py));
-  simprint.print_string("): [");
-  @map(print_data, dsd);
-  simprint.print_string("] ");
-}
-
-fn print_data(curL : f16) void {
-  simprint.print_f16(curL);
-  simprint.print_string(", ");
-}
+// (SDK-1.4 <debug>/<simprint> import + unused simprint_pe_coords_dsd/print_data
+//  helpers removed — not available on SDK 2.10.0 and never referenced.)
 
 // -------------------------------------------------------------------------- //
 // -------------------------------- Task IDs -------------------------------- //
