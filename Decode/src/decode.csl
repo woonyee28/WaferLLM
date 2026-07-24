@@ -80,8 +80,11 @@ var iter_num: i16 = 0;   // tokens cached at this PE (initialized to prefill_len
 var step: i16 = 0;       // global decode step counter (which PE row caches this token)
 
 const head_dim_f16: f16 = @as(f16, head_dim);
+// RMSNorm mean is over the FULL model dim (= P*dim_p_pe), not the attention head_dim.
+// Upstream divided by head_dim, correct only when head_dim==dim (single-head). Cf. Prefill c6ac12d.
+const model_dim_f16: f16 = @as(f16, P * dim_p_pe);
 
-const eps: f16 = 0.000001;
+const eps: f16 = 0.00001;   // Llama rms_norm_eps = 1e-5 (was 1e-6; matters at BOS/low-variance tokens)
 var alpha: f16 = 0.0;
 
 // -------------------------------------------------------------------------- //
@@ -183,7 +186,7 @@ fn fsubh_func(cur: f16) void {
 
 var cur_: f16 = 0.0;
 fn fmulh_norm_func(cur: f16) void {
-    cur_ = cur / head_dim_f16;
+    cur_ = cur / model_dim_f16;
     cur_ = 1.0 / math.sqrt(cur_ + eps);
     @fmulh(dest_dsr_1, src0_dsr_1, cur_);
 }
@@ -543,7 +546,7 @@ fn rmsnorm_x() void {
     comm_mod.all_reduce_bsz(py, quotient_y, remainder_y, ptr_local_sum);
 
     dim_p_pe_dsd_1 = @set_dsd_base_addr(dim_p_pe_dsd_1, ptr_X_norm);
-    dim_p_pe_dsd_2 = @set_dsd_base_addr(dim_p_pe_dsd_2, ptr_X_tmp);
+    dim_p_pe_dsd_2 = @set_dsd_base_addr(dim_p_pe_dsd_2, ptr_X);   // X, not X_tmp(=X^2): RMSNorm numerator is X
     @load_to_dsr(dest_dsr_1, dim_p_pe_dsd_1, .{ .save_address = true});
     @load_to_dsr(src0_dsr_1, dim_p_pe_dsd_2, .{ .save_address = true});
     @load_to_dsr(src1_dsr_1, W_dsd, .{ .save_address = false});
@@ -953,7 +956,7 @@ fn rmsnorm_z() void {
     comm_mod.all_reduce_bsz(py, quotient_y, remainder_y, ptr_local_sum);
 
     dim_p_pe_dsd_1 = @set_dsd_base_addr(dim_p_pe_dsd_1, ptr_z_norm);
-    dim_p_pe_dsd_2 = @set_dsd_base_addr(dim_p_pe_dsd_2, ptr_X_tmp);
+    dim_p_pe_dsd_2 = @set_dsd_base_addr(dim_p_pe_dsd_2, ptr_Z);   // Z, not X_tmp(=Z^2): RMSNorm numerator is Z
     @load_to_dsr(dest_dsr_1, dim_p_pe_dsd_1, .{ .save_address = true });
     @load_to_dsr(src0_dsr_1, dim_p_pe_dsd_2, .{ .save_address = true });
     @load_to_dsr(src1_dsr_1, W_dsd, .{ .save_address = false });
