@@ -40,13 +40,7 @@ param reduce_2nd_color_1: color;
 
 param broadcast_color: color;
 
-const trace = @import_module(
-  "<debug>",
-  .{ .key = "debug_comm",
-     .buffer_size = 100,
-   }
-);
-const simprint = @import_module("<simprint>");
+// (SDK-1.4 <debug>/<simprint> imports removed — unavailable on 2.10.0, unused here.)
 
 const reduce_1st_0_recv_queue_id = @get_input_queue(3);
 const reduce_1st_0_send_queue_id = @get_output_queue(3);
