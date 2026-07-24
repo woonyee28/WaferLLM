@@ -969,9 +969,12 @@ fn rmsnorm_z() void {
         @fmulh(dest_dsr_1, src0_dsr_1, src1_dsr_1);
     }
 
-    max_seq_len_p_pe_dsd_1 = @set_dsd_base_addr(max_seq_len_p_pe_dsd_1, ptr_z_norm);
-    @load_to_dsr(dest_dsr_1, max_seq_len_p_pe_dsd_1, .{ .save_address = true });
-    @load_to_dsr(src0_dsr_1, max_seq_len_p_pe_dsd_1, .{ .save_address = true });
+    // z_norm is [bsz][dim_p_pe]; scale each batch's dim_p_pe features by its per-batch rms factor.
+    // Must use the dim_p_pe DSD (as rmsnorm_x does), NOT max_seq_len_p_pe_dsd_1 whose length is left
+    // at iter_num by the preceding softmax and whose extent is max_seq_len_p_pe != dim_p_pe.
+    dim_p_pe_dsd_1 = @set_dsd_base_addr(dim_p_pe_dsd_1, ptr_z_norm);
+    @load_to_dsr(dest_dsr_1, dim_p_pe_dsd_1, .{ .save_address = true });
+    @load_to_dsr(src0_dsr_1, dim_p_pe_dsd_1, .{ .save_address = true });
     @map(fmulh_norm_func, local_sum_dsd);
 }
 
