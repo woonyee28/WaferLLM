@@ -9,7 +9,66 @@ param broadcast_color: color;
 param reduce_1st_color: [2]color;
 param reduce_2nd_color: [2]color;
 
-fn get_params(px: i16, quotient_x: i16, remainder_x: i16, py: i16, quotient_y: i16, remainder_y: i16) comptime_struct {
+// ---- SDK 2.10.0 route types --------------------------------------------------
+// On SDK 2.10.0 a function must return a NAMED type (the SDK-1.4 `comptime_struct`
+// return type is rejected). These types are ported verbatim from the base Decode's
+// 2.10.0 comm_layout; comm_params_t is extended with the GQA head-scoped and
+// KV-head-scoped route fields. get_params' body and return literal are unchanged.
+const rd_route_t = struct {
+    rx: direction,
+    tx: [1]direction,
+};
+
+const bd_route_edge_t = struct {
+    rx: direction,
+    tx: [1]direction,
+};
+const bd_route_mid_t = struct {
+    rx: direction,
+    tx: [2]direction,
+};
+
+fn bd_route_t(comptime is_edge: bool) type {
+    return if (is_edge) bd_route_edge_t else bd_route_mid_t;
+}
+
+fn comm_params_t(comptime x_edge: bool, comptime y_edge: bool,
+                 comptime head_edge: bool, comptime kv_head_edge: bool) type {
+    return struct {
+        X_1st_RD_0: rd_route_t,
+        X_1st_RD_1: rd_route_t,
+        Y_1st_RD_0: rd_route_t,
+        Y_1st_RD_1: rd_route_t,
+
+        X_2nd_RD_0: rd_route_t,
+        X_2nd_RD_1: rd_route_t,
+        Y_2nd_RD_0: rd_route_t,
+        Y_2nd_RD_1: rd_route_t,
+
+        X_HEAD_2nd_RD_0: rd_route_t,
+        X_HEAD_2nd_RD_1: rd_route_t,
+        X_HEAD_BD: bd_route_t(head_edge),
+
+        X_KV_HEAD_2nd_RD_0: rd_route_t,
+        X_KV_HEAD_2nd_RD_1: rd_route_t,
+        X_KV_HEAD_BD: bd_route_t(kv_head_edge),
+
+        X_BD: bd_route_t(x_edge),
+        Y_BD: bd_route_t(y_edge),
+
+        reduce_1st_color_0: color,
+        reduce_1st_color_1: color,
+        reduce_2nd_color_0: color,
+        reduce_2nd_color_1: color,
+        broadcast_color: color,
+    };
+}
+
+fn get_params(comptime px: i16, comptime quotient_x: i16, comptime remainder_x: i16, comptime py: i16, comptime quotient_y: i16, comptime remainder_y: i16) comm_params_t(
+        px == 0 or px == P - 1,
+        py == 0 or py == P - 1,
+        (px % pes_p_head == 0) or (px % pes_p_head == pes_p_head - 1),
+        (px % pes_p_kv_head == 0) or (px % pes_p_kv_head == pes_p_kv_head - 1)) {
 
     var X_1st_RD_0 = .{ .rx = RAMP, .tx = [1]direction{ RAMP } };
     var X_1st_RD_1 = .{ .rx = RAMP, .tx = [1]direction{ RAMP } };
