@@ -418,6 +418,10 @@ var X_odd_dsd = @get_dsd(mem1d_dsd, .{ .base_address = &dummy, .offset = 1, .ext
 
 var local_sum: [bsz]f16 = @zeros([bsz]f16);
 var ptr_local_sum: [*]f16 = &local_sum;
+
+// DBG: snapshot of rmsnorm_x's post-reduce sum-of-squares per batch (to localize the bsz>1 halving)
+var local_sum_dbg: [bsz]f16 = @zeros([bsz]f16);
+var ptr_local_sum_dbg: [*]f16 = &local_sum_dbg;
 var local_sum_dsd = @get_dsd(mem1d_dsd, .{ .base_address = &local_sum, .extent = bsz });
 
 var sum: f16 = 0.0;
@@ -553,6 +557,8 @@ fn rmsnorm_x() void {
     }
 
     comm_mod.all_reduce_bsz(py, quotient_y, remainder_y, ptr_local_sum);
+
+    for (@range(i16, bsz)) |b| { local_sum_dbg[b] = local_sum[b]; }   // DBG: post-reduce sum-of-squares
 
     dim_p_pe_dsd_1 = @set_dsd_base_addr(dim_p_pe_dsd_1, ptr_X_norm);
     dim_p_pe_dsd_2 = @set_dsd_base_addr(dim_p_pe_dsd_2, ptr_X);   // X, not X_tmp(=X^2): RMSNorm numerator is X
@@ -1195,4 +1201,5 @@ comptime {
     @export_symbol(ptr_score_post_reduce, "score_post_reduce"); // after reduce+alpha, before softmax [bsz*max_seq_len_p_pe]
     @export_symbol(ptr_score, "score");                       // post-softmax attn [bsz*max_seq_len_p_pe]
     @export_symbol(ptr_output, "output_tile");                // post-output-matmul [bsz*dim_p_pe]
+    @export_symbol(ptr_local_sum_dbg, "local_sum_dbg");       // DBG: rmsnorm_x post-reduce sum-of-squares [bsz]
 }

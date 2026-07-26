@@ -128,4 +128,5 @@ layout {
     @export_name("score_post_reduce", [*]f16, true);
     @export_name("score",           [*]f16, true);
     @export_name("output_tile",     [*]f16, true);
+    @export_name("local_sum_dbg",   [*]f16, true);
 }

@@ -550,6 +550,7 @@ def main():
         sym_score_post_reduce = runner.get_id("score_post_reduce")
         sym_score            = runner.get_id("score")
         sym_output_tile      = runner.get_id("output_tile")
+        sym_local_sum_dbg    = runner.get_id("local_sum_dbg")
 
     # ─── H2D memcpy ───────────────────────────────────────────────────────────
     def h2d(sym, flat_arr, count_per_pe):
@@ -602,6 +603,17 @@ def main():
         score_reduce_grid = d2h(runner, sym_score_post_reduce, P, bsz, gqa_group_size * max_seq_len_p_pe, io_dtype, memcpy_order)
         score_grid        = d2h(runner, sym_score,             P, bsz, gqa_group_size * max_seq_len_p_pe,  io_dtype, memcpy_order)
         out_grid          = d2h(runner, sym_output_tile,       P, bsz, dim_p_pe,      io_dtype, memcpy_order)
+
+        # ── DBG: rmsnorm_x post-reduce sum-of-squares per batch (localize the bsz>1 halving) ──
+        ls_grid  = d2h(runner, sym_local_sum_dbg, P, 1, bsz, io_dtype, memcpy_order)   # [P, P, bsz]
+        ls_expect = np.sum(X_raw.reshape(bsz, dim).astype(np.float32) ** 2, axis=1)     # [bsz] full-dim sum of X^2
+        sep("DBG — rmsnorm_x post-reduce local_sum  (should equal sum_d X[b,d]^2 per batch)")
+        print(f"  expected per batch : {[round(float(v), 5) for v in ls_expect]}")
+        for _py in range(min(P, 2)):
+            for _px in range(min(P, 2)):
+                got = ls_grid[_py, _px, :].astype(np.float32)
+                ratio = [round(float(got[b] / ls_expect[b]), 4) if ls_expect[b] != 0 else 0.0 for b in range(bsz)]
+                print(f"  PE(py={_py},px={_px})  local_sum={[round(float(v),5) for v in got]}   sim/expected={ratio}")
 
     # ─── D2H: timer ───────────────────────────────────────────────────────────
     timer_buf_1d = np.zeros(P * P * 3, dtype=np.uint32)
