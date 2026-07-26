@@ -544,10 +544,10 @@ const root_head_2nd_in_head: i16 = (groups_per_head / 2) * pe_num_p_group + root
 const groups_per_kv_head: i16 = pes_p_kv_head / pe_num_p_group;
 const root_kv_head_2nd_in_head: i16 = (groups_per_kv_head / 2) * pe_num_p_group + root_1st_phase;
 
-fn init() void {
-    // wse3: bind each fabric color to its queue. The DSDs' `.fabric_color` is deprecated and
-    // ignored on wse3, so without this the queues carry no color and multi-element reduces
-    // mis-route (the bsz>1 batch-0 halving). Mirrors Prefill comm_pe init_ (@initialize_queue).
+// wse3: bind each reduce/bcast color to its queue (replaces the deprecated per-DSD
+// .fabric_color). Without this the queues carry no color -> multi-element reduces
+// mis-route (the bsz>1 batch-0 halving). Must be a top-level comptime block (Prefill form).
+comptime {
     @initialize_queue(reduce_1st_0_recv_queue_id, .{ .color = reduce_1st_color_0 });
     @initialize_queue(reduce_1st_0_send_queue_id, .{ .color = reduce_1st_color_0 });
     @initialize_queue(reduce_1st_1_recv_queue_id, .{ .color = reduce_1st_color_1 });
@@ -558,7 +558,9 @@ fn init() void {
     @initialize_queue(reduce_2nd_1_send_queue_id, .{ .color = reduce_2nd_color_1 });
     @initialize_queue(broadcast_recv_queue_id, .{ .color = broadcast_color });
     @initialize_queue(broadcast_send_queue_id, .{ .color = broadcast_color });
+}
 
+fn init() void {
     color_config.reset_routes(reduce_1st_color_0, Y_1st_RD_0);
     color_config.reset_routes(reduce_1st_color_1, Y_1st_RD_1);
 
