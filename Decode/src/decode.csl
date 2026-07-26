@@ -619,87 +619,41 @@ fn xv_matvec_mult() void {
     vecmat_computation();
 }
 
+// De-strided RoPE. The old version used odd-offset strided DSDs whose @fmulh
+// writes silently drop on wse3 (they zeroed the odd lane -> group-0 Q). Here each
+// (even,odd) pair is rotated with plain scalar indexing, so no strided write is used.
+//   even' = odd*cos - even*sin ,  odd' = even*cos + odd*sin   (matches rope_csl).
+var rope_e: f16 = 0.0;
+var rope_o: f16 = 0.0;
 fn xq_rope() void {
-    X_even_dsd = @set_dsd_base_addr(X_even_dsd, ptr_QKV_tile);
-    X_odd_dsd = @set_dsd_base_addr(X_odd_dsd, ptr_QKV_tile);
-
-    @load_to_dsr(dest_dsr_1, X_tmp_1_dsd);
-    @load_to_dsr(dest_dsr_2, X_tmp_2_dsd);
-    @load_to_dsr(dest_dsr_3, X_tmp_3_dsd);
-    @load_to_dsr(dest_dsr_4, X_tmp_4_dsd);
-
-    @load_to_dsr(src1_dsr_1, freqs_cos_dsd);
-    @load_to_dsr(src1_dsr_2, freqs_sin_dsd);
-    @load_to_dsr(src1_dsr_3, freqs_cos_dsd);
-    @load_to_dsr(src1_dsr_4, freqs_sin_dsd);
-
+    // Q is dim_p_pe wide per batch, at offset b*dim_p_pe in QKV_tile.
+    const npairs: i16 = _dim_p_pe / 2;
     for (@range(i16, bsz)) |b| {
-
-        @load_to_dsr(src0_dsr_1, X_odd_dsd);
-        @load_to_dsr(src0_dsr_2, X_even_dsd);
-        @load_to_dsr(src0_dsr_3, X_even_dsd);
-        @load_to_dsr(src0_dsr_4, X_odd_dsd);
-
-        @fmulh(dest_dsr_1, src0_dsr_1, src1_dsr_1);
-        @fmulh(dest_dsr_2, src0_dsr_2, src1_dsr_2);
-        @fmulh(dest_dsr_3, src0_dsr_3, src1_dsr_3);
-        @fmulh(dest_dsr_4, src0_dsr_4, src1_dsr_4);
-
-        @load_to_dsr(dest_dsr_5, X_even_dsd);
-        @load_to_dsr(src0_dsr_5, X_tmp_1_dsd);
-        @load_to_dsr(src1_dsr_5, X_tmp_2_dsd);
-        @fsubh(dest_dsr_5, src0_dsr_5, src1_dsr_5);
-
-        @load_to_dsr(dest_dsr_5, X_odd_dsd);
-        @load_to_dsr(src0_dsr_5, X_tmp_3_dsd);
-        @load_to_dsr(src1_dsr_5, X_tmp_4_dsd);
-        @faddh(dest_dsr_5, src0_dsr_5, src1_dsr_5);
-
-        X_even_dsd = @increment_dsd_offset(X_even_dsd, dim_p_pe, f16);
-        X_odd_dsd = @increment_dsd_offset(X_odd_dsd, dim_p_pe, f16);
+        var base: i16 = b * dim_p_pe;
+        for (@range(i16, npairs)) |i| {
+            rope_e = QKV_tile[base + 2 * i];
+            rope_o = QKV_tile[base + 2 * i + 1];
+            QKV_tile[base + 2 * i]     = rope_o * freqs_cos[i] - rope_e * freqs_sin[i];
+            QKV_tile[base + 2 * i + 1] = rope_e * freqs_cos[i] + rope_o * freqs_sin[i];
+        }
     }
 }
 
 fn xk_rope() void {
-    X_even_dsd = @set_dsd_base_addr(X_even_dsd, ptr_QKV_tile);
-    X_odd_dsd = @set_dsd_base_addr(X_odd_dsd, ptr_QKV_tile);
-    X_even_dsd = @increment_dsd_offset(X_even_dsd, bsz*dim_p_pe, f16);
-    X_odd_dsd = @increment_dsd_offset(X_odd_dsd, bsz*dim_p_pe, f16);
-
-    @load_to_dsr(dest_dsr_1, X_tmp_1_dsd);
-    @load_to_dsr(dest_dsr_2, X_tmp_2_dsd);
-    @load_to_dsr(dest_dsr_3, X_tmp_3_dsd);
-    @load_to_dsr(dest_dsr_4, X_tmp_4_dsd);
-
-    @load_to_dsr(src1_dsr_1, freqs_cos_dsd);
-    @load_to_dsr(src1_dsr_2, freqs_sin_dsd);
-    @load_to_dsr(src1_dsr_3, freqs_cos_dsd);
-    @load_to_dsr(src1_dsr_4, freqs_sin_dsd);
-
+    // K is kv_dim_p_pe wide per batch, at offset bsz*dim_p_pe + b*kv_dim_p_pe.
+    // Uses the first _kv_dim_p_pe/2 freqs. At kv_dim_p_pe==1 there are 0 local pairs
+    // -> no-op (a K pair straddles 2 PEs; needs a nearest-neighbour exchange, TODO).
+    // NB: the old strided version wrongly advanced by dim_p_pe and used _dim_p_pe/2 pairs.
+    const npairs: i16 = _kv_dim_p_pe / 2;
+    const k_base0: i16 = bsz * dim_p_pe;
     for (@range(i16, bsz)) |b| {
-
-        @load_to_dsr(src0_dsr_1, X_odd_dsd);
-        @load_to_dsr(src0_dsr_2, X_even_dsd);
-        @load_to_dsr(src0_dsr_3, X_even_dsd);
-        @load_to_dsr(src0_dsr_4, X_odd_dsd);
-
-        @fmulh(dest_dsr_1, src0_dsr_1, src1_dsr_1);
-        @fmulh(dest_dsr_2, src0_dsr_2, src1_dsr_2);
-        @fmulh(dest_dsr_3, src0_dsr_3, src1_dsr_3);
-        @fmulh(dest_dsr_4, src0_dsr_4, src1_dsr_4);
-
-        @load_to_dsr(dest_dsr_5, X_even_dsd);
-        @load_to_dsr(src0_dsr_5, X_tmp_1_dsd);
-        @load_to_dsr(src1_dsr_5, X_tmp_2_dsd);
-        @fsubh(dest_dsr_5, src0_dsr_5, src1_dsr_5);
-
-        @load_to_dsr(dest_dsr_5, X_odd_dsd);
-        @load_to_dsr(src0_dsr_5, X_tmp_3_dsd);
-        @load_to_dsr(src1_dsr_5, X_tmp_4_dsd);
-        @faddh(dest_dsr_5, src0_dsr_5, src1_dsr_5);
-
-        X_even_dsd = @increment_dsd_offset(X_even_dsd, dim_p_pe, f16);
-        X_odd_dsd = @increment_dsd_offset(X_odd_dsd, dim_p_pe, f16);
+        var base: i16 = k_base0 + b * kv_dim_p_pe;
+        for (@range(i16, npairs)) |i| {
+            rope_e = QKV_tile[base + 2 * i];
+            rope_o = QKV_tile[base + 2 * i + 1];
+            QKV_tile[base + 2 * i]     = rope_o * freqs_cos[i] - rope_e * freqs_sin[i];
+            QKV_tile[base + 2 * i + 1] = rope_e * freqs_cos[i] + rope_o * freqs_sin[i];
+        }
     }
 }
 
