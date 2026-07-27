@@ -23,12 +23,15 @@ import json
 import argparse
 import numpy as np
 
-from cerebras.sdk.sdk_utils import input_array_to_u32
-from cerebras.sdk.runtime.sdkruntimepybind import SdkRuntime, MemcpyDataType, MemcpyOrder
+# Appliance/cluster device flow (mirrors Prefill): cloud artifact + client SdkRuntime(simulator=...).
+from cerebras.sdk.client import SdkRuntime
+from cerebras.appliance.pb.sdk.sdk_common_pb2 import MemcpyDataType, MemcpyOrder
 
-# Reuse the validated decode helpers (module-guarded; safe to import).
-from launch_sim import d2h, sep
-from launch_verify import load_block0_weights, report, report_contrib
+# Reuse the validated decode helpers (main-guarded; safe to import).
+from launch_sim import sep
+from launch_verify import load_block0_weights, report, report_contrib, cast_tensor_u32, d2h
+
+OUT_PATH = "compile_out"  # cloud artifacts written by `python compile.py --mode device`
 
 
 def parse_args():
@@ -39,7 +42,8 @@ def parse_args():
     ap.add_argument("--pos", type=int, default=64,
                     help="oracle decode position to validate against (= attention stage prefill_len)")
     ap.add_argument("--oracle-dir", default=None, help="dir with resid_*_block0.npy (default: <repo>/pytorch/oracle_decode)")
-    ap.add_argument("--cmaddr", default=None, help="CM address for WSE-3 hardware (else simulator)")
+    ap.add_argument("--simulator", action="store_true",
+                    help="run the cloud artifact in the appliance SIMULATOR (default: real WSE-3)")
     return ap.parse_args()
 
 
@@ -102,31 +106,27 @@ def main():
     tensor_W2 = np.tile(w["norm_post"].reshape(P, dim_p_pe), reps=(1, P))
     tensor_X  = np.tile(x_in.reshape(P, dim_p_pe),           reps=(1, P))
 
-    # ── Runner ────────────────────────────────────────────────────────────────────
-    if args.cmaddr:
-        runner = SdkRuntime("out", cmaddr=args.cmaddr)
-    else:
-        runner = SdkRuntime("out", simfab_numthreads=64, msg_level='INFO')
-    runner.load()
-    runner.run()
+    # ── Runner (client API: cloud artifact; simulator=False -> real WSE-3, like Prefill) ──
+    cfg_name = os.path.splitext(os.path.basename(args.config))[0]
+    with open(os.path.join(OUT_PATH, f"artifact_{cfg_name}.json"), encoding="utf-8") as f:
+        artifact_id = json.load(f)["artifact_id"]
 
-    def h2d(name, flat_arr, count_per_pe):
-        u32 = input_array_to_u32(flat_arr.ravel(), 1, 1)
-        runner.memcpy_h2d(runner.get_id(name), u32, 0, 0, P, P, count_per_pe,
-                          streaming=False, data_type=io_dtype, order=memcpy_order, nonblock=False)
+    with SdkRuntime(artifact_id, simulator=args.simulator) as runner:
+        def h2d(name, flat_arr, count_per_pe):
+            runner.memcpy_h2d(runner.get_id(name), cast_tensor_u32(flat_arr.ravel()), 0, 0, P, P, count_per_pe,
+                              streaming=False, data_type=io_dtype, order=memcpy_order, nonblock=False)
 
-    # Only the FFN inputs; attention weights/cache stay zero (unused when ffn_only=1).
-    h2d("X",           tensor_X,  bsz * dim_p_pe)
-    h2d("W2",          tensor_W2, dim_p_pe)
-    h2d("UP_weight",   UP_tile,   dim_p_pe * ffn_dim_p_pe)
-    h2d("GATE_weight", GT_tile,   dim_p_pe * ffn_dim_p_pe)
-    h2d("DOWN_weight", DN_tile,   ffn_dim_p_pe * dim_p_pe)
+        # Only the FFN inputs; attention weights/cache stay zero (unused when ffn_only=1).
+        h2d("X",           tensor_X,  bsz * dim_p_pe)
+        h2d("W2",          tensor_W2, dim_p_pe)
+        h2d("UP_weight",   UP_tile,   dim_p_pe * ffn_dim_p_pe)
+        h2d("GATE_weight", GT_tile,   dim_p_pe * ffn_dim_p_pe)
+        h2d("DOWN_weight", DN_tile,   ffn_dim_p_pe * dim_p_pe)
 
-    runner.launch("init_task", nonblock=False)
-    runner.launch("decode_host", np.int16(1), np.int16(0), nonblock=False)   # 1 step, 0 warmup
+        runner.launch("init_task", nonblock=False)
+        runner.launch("decode_host", np.int16(1), np.int16(0), nonblock=False)   # 1 step
 
-    post_grid = d2h(runner, runner.get_id("resid_post"), P, bsz, dim_p_pe, io_dtype, memcpy_order)
-    runner.stop()
+        post_grid = d2h(runner, runner.get_id("resid_post"), P, bsz, dim_p_pe, io_dtype, memcpy_order)
 
     def reconstruct(grid):
         out = np.zeros(P * dim_p_pe, dtype=np.float32)

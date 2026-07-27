@@ -18,13 +18,31 @@ import glob
 import argparse
 import numpy as np
 
-from cerebras.sdk.sdk_utils import input_array_to_u32, memcpy_view
-from cerebras.sdk.runtime.sdkruntimepybind import SdkRuntime, MemcpyDataType, MemcpyOrder
+# Appliance/cluster device flow (mirrors Prefill/launch_device.py): cloud-compiled artifact +
+# cerebras.sdk.client.SdkRuntime(simulator=...). EIDF eidf002-cs3 is appliance-mode (no cmaddr).
+from cerebras.sdk.client import SdkRuntime, sdk_utils
+from cerebras.appliance.pb.sdk.sdk_common_pb2 import MemcpyDataType, MemcpyOrder
 
-# Reuse the validated decode-layout helpers from launch_sim.py (module-guarded; safe to import).
-from launch_sim import d2h, tile_kcache_interleaved, tile_vcache_interleaved, sep
+# Reuse the validated decode-layout NUMPY helpers from launch_sim.py (main-guarded; safe to import).
+from launch_sim import tile_kcache_interleaved, tile_vcache_interleaved, sep
 
 THETA = 500000.0  # Llama-3 RoPE base
+OUT_PATH = "compile_out"  # cloud artifacts written by `python compile.py --mode device`
+
+
+def cast_tensor_u32(t):
+    """fp16 tensor -> u32 view (memcpy transfers use 32-bit buffers); matches Prefill launch_device."""
+    return np.uint32(t.view(np.uint16))
+
+
+def d2h(runner, sym_id, P, bsz, data_per_pe, io_dtype, memcpy_order):
+    """Client-API read of P×P PEs, each contributing bsz*data_per_pe f16 -> grid [P, P, count]
+    (same shape/order as launch_sim.d2h so reconstruct() is unchanged)."""
+    count = bsz * data_per_pe
+    buf = np.zeros(P * P * count, dtype=np.uint32)
+    runner.memcpy_d2h(buf, sym_id, 0, 0, P, P, count,
+                      streaming=False, data_type=io_dtype, order=memcpy_order, nonblock=False)
+    return sdk_utils.memcpy_view(buf, np.dtype(np.float16)).reshape(P, P, count)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -111,7 +129,8 @@ def parse_args():
     ap = argparse.ArgumentParser(description="Validate Decode kernel vs transformer_lens (real Llama-3-8B block 0)")
     ap.add_argument("--config", default="model_config/llama8B_block0_p32.json")
     ap.add_argument("--oracle-dir", default=None, help="dir with resid_*_block0.npy + k/v_cache (default: <repo>/pytorch/oracle_decode)")
-    ap.add_argument("--cmaddr", default=None, help="CM address for WSE-3 hardware (else simulator)")
+    ap.add_argument("--simulator", action="store_true",
+                    help="run the cloud artifact in the appliance SIMULATOR (default: real WSE-3)")
     ap.add_argument("--save-zmid", default="csl_decode_zmid.npy",
                     help="path to write the DEVICE resid_mid (Z_mid), threaded into the FFN stage")
     return ap.parse_args()
@@ -245,41 +264,37 @@ def main():
     X_raw = resid_pre[prefill_len].astype(np.float16)                 # [dim]
     tensor_X = np.tile(X_raw.reshape(P, dim_p_pe), reps=(1, P))
 
-    # ── Runner ──────────────────────────────────────────────────────────────
-    if args.cmaddr:
-        runner = SdkRuntime("out", cmaddr=args.cmaddr)
-    else:
-        runner = SdkRuntime("out", simfab_numthreads=64, msg_level='INFO')
-    runner.load()
-    runner.run()
+    # ── Runner (client API: cloud artifact; simulator=False -> real WSE-3, like Prefill) ──
+    cfg_name = os.path.splitext(os.path.basename(args.config))[0]
+    with open(os.path.join(OUT_PATH, f"artifact_{cfg_name}.json"), encoding="utf-8") as f:
+        artifact_id = json.load(f)["artifact_id"]
 
-    def h2d(name, flat_arr, count_per_pe):
-        u32 = input_array_to_u32(flat_arr.ravel(), 1, 1)
-        runner.memcpy_h2d(runner.get_id(name), u32, 0, 0, P, P, count_per_pe,
-                          streaming=False, data_type=io_dtype, order=memcpy_order, nonblock=False)
+    with SdkRuntime(artifact_id, simulator=args.simulator) as runner:
+        def h2d(name, flat_arr, count_per_pe):
+            runner.memcpy_h2d(runner.get_id(name), cast_tensor_u32(flat_arr.ravel()), 0, 0, P, P, count_per_pe,
+                              streaming=False, data_type=io_dtype, order=memcpy_order, nonblock=False)
 
-    h2d("X",           tensor_X,         bsz * dim_p_pe)
-    h2d("W",           tensor_W,         dim_p_pe)
-    h2d("W2",          tensor_W2,        dim_p_pe)
-    h2d("Q_weight",    Q_tile,           dim_p_pe * dim_p_pe)
-    h2d("K_weight",    K_tile,           dim_p_pe * kv_dim_p_pe)
-    h2d("V_weight",    V_tile,           dim_p_pe * kv_dim_p_pe)
-    h2d("freqs_sin",   tensor_freqs_sin, _dim_p_pe // 2)
-    h2d("freqs_cos",   tensor_freqs_cos, _dim_p_pe // 2)
-    h2d("XKCache",     KCache_tile,      bsz * kv_dim_p_pe * max_seq_len_p_pe)
-    h2d("XVCache",     VCache_tile,      bsz * max_seq_len_p_pe * kv_dim_p_pe)
-    h2d("O_weight",    O_tile,           dim_p_pe * dim_p_pe)
-    h2d("UP_weight",   UP_tile,          dim_p_pe * ffn_dim_p_pe)
-    h2d("GATE_weight", GT_tile,          dim_p_pe * ffn_dim_p_pe)
-    h2d("DOWN_weight", DN_tile,          ffn_dim_p_pe * dim_p_pe)
+        h2d("X",           tensor_X,         bsz * dim_p_pe)
+        h2d("W",           tensor_W,         dim_p_pe)
+        h2d("W2",          tensor_W2,        dim_p_pe)
+        h2d("Q_weight",    Q_tile,           dim_p_pe * dim_p_pe)
+        h2d("K_weight",    K_tile,           dim_p_pe * kv_dim_p_pe)
+        h2d("V_weight",    V_tile,           dim_p_pe * kv_dim_p_pe)
+        h2d("freqs_sin",   tensor_freqs_sin, _dim_p_pe // 2)
+        h2d("freqs_cos",   tensor_freqs_cos, _dim_p_pe // 2)
+        h2d("XKCache",     KCache_tile,      bsz * kv_dim_p_pe * max_seq_len_p_pe)
+        h2d("XVCache",     VCache_tile,      bsz * max_seq_len_p_pe * kv_dim_p_pe)
+        h2d("O_weight",    O_tile,           dim_p_pe * dim_p_pe)
+        h2d("UP_weight",   UP_tile,          dim_p_pe * ffn_dim_p_pe)
+        h2d("GATE_weight", GT_tile,          dim_p_pe * ffn_dim_p_pe)
+        h2d("DOWN_weight", DN_tile,          ffn_dim_p_pe * dim_p_pe)
 
-    runner.launch("init_task", nonblock=False)
-    runner.launch("decode_host", np.int16(1), np.int16(0), nonblock=False)   # 1 decode step, 0 warmup
+        runner.launch("init_task", nonblock=False)
+        runner.launch("decode_host", np.int16(1), np.int16(0), nonblock=False)   # 1 decode step
 
-    pre_grid  = d2h(runner, runner.get_id("resid_pre"),  P, bsz, dim_p_pe, io_dtype, memcpy_order)
-    mid_grid  = d2h(runner, runner.get_id("resid_mid"),  P, bsz, dim_p_pe, io_dtype, memcpy_order)
-    post_grid = d2h(runner, runner.get_id("resid_post"), P, bsz, dim_p_pe, io_dtype, memcpy_order)
-    runner.stop()
+        pre_grid  = d2h(runner, runner.get_id("resid_pre"),  P, bsz, dim_p_pe, io_dtype, memcpy_order)
+        mid_grid  = d2h(runner, runner.get_id("resid_mid"),  P, bsz, dim_p_pe, io_dtype, memcpy_order)
+        post_grid = d2h(runner, runner.get_id("resid_post"), P, bsz, dim_p_pe, io_dtype, memcpy_order)
 
     # Residual stream is dim-block by py, replicated across px -> gather py, use px=0.
     def reconstruct(grid):
