@@ -909,16 +909,15 @@ fn attn_residual_add() void {
 }
 
 fn rmsnorm_z() void {
-    @load_to_dsr(dest_dsr_1, X_tmp_dsd);
-    @load_to_dsr(src0_dsr_1, Z_dsd);
-    @load_to_dsr(src1_dsr_1, Z_dsd);
-    @fmulh(dest_dsr_1, src0_dsr_1, src1_dsr_1);
-    
-    dim_p_pe_dsd_1 = @set_dsd_base_addr(dim_p_pe_dsd_1, ptr_X_tmp);
-    @load_to_dsr(src1_dsr_1, dim_p_pe_dsd_1, .{ .save_address = true });
+    // Per-batch sum of squares, explicit scalar accumulation (same fix as rmsnorm_x: the
+    // save_address DSR reduce miscounted batch 0's extent at bsz>1).
+    var zv: f16 = 0.0;
     for (@range(i16, bsz)) |b| {
         sum = 0.0;
-        @faddh(ptr_sum, sum, src1_dsr_1);
+        for (@range(i16, dim_p_pe)) |i| {
+            zv = Z_tile[b * dim_p_pe + i];
+            sum += zv * zv;
+        }
         local_sum[b] = sum;
     }
 
