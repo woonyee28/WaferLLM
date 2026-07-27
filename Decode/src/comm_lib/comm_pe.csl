@@ -134,6 +134,23 @@ const bdcast_recv_bsz = @get_dsd(fabin_dsd, .{
     // .simd_mode = .{ .simd_64 = true },
 });
 
+// -------- length-1 variants (per-element reduce) --------
+// The batched both-ends reduce halves the first half of a length>1 vector (a wse fabric-level
+// issue below the CSL layer; see all_reduce_bsz). A length-1 reduce is proven correct (bsz=1),
+// so all_reduce_bsz reduces each batch element separately with these extent-1 DSDs (same
+// queues/colors as the _bsz set).
+const reduce_1st_0_send_1 = @get_dsd(fabout_dsd, .{ .extent = 1, .output_queue = reduce_1st_0_send_queue_id });
+const reduce_1st_0_recv_1 = @get_dsd(fabin_dsd,  .{ .extent = 1, .input_queue  = reduce_1st_0_recv_queue_id });
+const reduce_1st_1_send_1 = @get_dsd(fabout_dsd, .{ .extent = 1, .output_queue = reduce_1st_1_send_queue_id });
+const reduce_1st_1_recv_1 = @get_dsd(fabin_dsd,  .{ .extent = 1, .input_queue  = reduce_1st_1_recv_queue_id });
+const reduce_2nd_0_send_1 = @get_dsd(fabout_dsd, .{ .extent = 1, .output_queue = reduce_2nd_0_send_queue_id });
+const reduce_2nd_0_recv_1 = @get_dsd(fabin_dsd,  .{ .extent = 1, .input_queue  = reduce_2nd_0_recv_queue_id });
+const reduce_2nd_1_send_1 = @get_dsd(fabout_dsd, .{ .extent = 1, .output_queue = reduce_2nd_1_send_queue_id });
+const reduce_2nd_1_recv_1 = @get_dsd(fabin_dsd,  .{ .extent = 1, .input_queue  = reduce_2nd_1_recv_queue_id });
+const bdcast_send_1 = @get_dsd(fabout_dsd, .{ .extent = 1, .output_queue = broadcast_send_queue_id });
+const bdcast_recv_1 = @get_dsd(fabin_dsd,  .{ .extent = 1, .input_queue  = broadcast_recv_queue_id });
+var vector_buf_dsd_1 = @get_dsd(mem1d_dsd, .{ .base_address = &dummy, .extent = 1 });
+
 // *************************** gqa_group_size * bsz ***************************//
 const gqa_group_size: i16 = dim_p_pe / kv_dim_p_pe;
 
@@ -554,76 +571,76 @@ fn init() void {
     color_config.reset_routes(broadcast_color, Y_BD);
 }
 
-fn all_reduce_bsz(pe_id: i16, quotient_pe_id: i16, remainder_pe_id: i16, vector_buf_ptr: [*]f16) void {
-    vector_buf_dsd_bsz = @set_dsd_base_addr(vector_buf_dsd_bsz, vector_buf_ptr);
-    @load_to_dsr(vector_buf_dsr, vector_buf_dsd_bsz);
+// Length-1 both-ends reduce of vector_buf_ptr[b] (one batch element). Correct at any config
+// (bsz=1 validated). all_reduce_bsz loops this over b to avoid the multi-element fabric bug.
+fn all_reduce_1(pe_id: i16, quotient_pe_id: i16, remainder_pe_id: i16, vector_buf_ptr: [*]f16, b: i16) void {
+    vector_buf_dsd_1 = @set_dsd_base_addr(vector_buf_dsd_1, vector_buf_ptr);
+    vector_buf_dsd_1 = @increment_dsd_offset(vector_buf_dsd_1, b, f16);
+    @load_to_dsr(vector_buf_dsr, vector_buf_dsd_1);
 
     // 1st phase reduce
     if (remainder_pe_id == root_1st_phase) {
         if (root_1st_phase < pe_num_p_group - 1) {
-            @faddh(vector_buf_dsd_bsz, reduce_1st_0_recv_bsz, vector_buf_dsr);
+            @faddh(vector_buf_dsd_1, reduce_1st_0_recv_1, vector_buf_dsr);
         }
-        @faddh(vector_buf_dsd_bsz, reduce_1st_1_recv_bsz, vector_buf_dsr);
+        @faddh(vector_buf_dsd_1, reduce_1st_1_recv_1, vector_buf_dsr);
     } else if (remainder_pe_id > root_1st_phase) {
         if (remainder_pe_id % 2 == 0) {
             if (remainder_pe_id == pe_num_p_group - 1) {
-                @fmovh(reduce_1st_0_send_bsz, vector_buf_dsr);
+                @fmovh(reduce_1st_0_send_1, vector_buf_dsr);
             } else {
-                @faddh(reduce_1st_0_send_bsz, reduce_1st_1_recv_bsz, vector_buf_dsr);
+                @faddh(reduce_1st_0_send_1, reduce_1st_1_recv_1, vector_buf_dsr);
             }
         } else {
-            // remainder_pe_id % 2 == 1
             if (remainder_pe_id == pe_num_p_group - 1) {
-                @fmovh(reduce_1st_1_send_bsz, vector_buf_dsr);
+                @fmovh(reduce_1st_1_send_1, vector_buf_dsr);
             } else {
-                @faddh(reduce_1st_1_send_bsz, reduce_1st_0_recv_bsz, vector_buf_dsr);
+                @faddh(reduce_1st_1_send_1, reduce_1st_0_recv_1, vector_buf_dsr);
             }
         }
     } else {
-        // remainder_pe_id < root_1st_phase
         if (remainder_pe_id % 2 == 0) {
             if (remainder_pe_id == 0) {
-                @fmovh(reduce_1st_1_send_bsz, vector_buf_dsr);
+                @fmovh(reduce_1st_1_send_1, vector_buf_dsr);
             } else {
-                @faddh(reduce_1st_1_send_bsz, reduce_1st_0_recv_bsz, vector_buf_dsr);
+                @faddh(reduce_1st_1_send_1, reduce_1st_0_recv_1, vector_buf_dsr);
             }
         } else {
-            // remainder_pe_id never be 0
-            @faddh(reduce_1st_0_send_bsz, reduce_1st_1_recv_bsz, vector_buf_dsr);
+            @faddh(reduce_1st_0_send_1, reduce_1st_1_recv_1, vector_buf_dsr);
         }
     }
 
     // 2nd phase reduce
     if (pe_id == root_2nd_phase) {
         if (root_2nd_phase < P - pe_num_p_group) {
-            @faddh(vector_buf_dsd_bsz, reduce_2nd_0_recv_bsz, vector_buf_dsr);
+            @faddh(vector_buf_dsd_1, reduce_2nd_0_recv_1, vector_buf_dsr);
         }
-        @faddh(vector_buf_dsd_bsz, reduce_2nd_1_recv_bsz, vector_buf_dsr);
+        @faddh(vector_buf_dsd_1, reduce_2nd_1_recv_1, vector_buf_dsr);
     } else if (pe_id > root_2nd_phase) {
         if (remainder_pe_id == root_1st_phase) {
             if (pe_id > P - pe_num_p_group - 1) {
                 if (quotient_pe_id % 2 == 0) {
-                    @fmovh(reduce_2nd_0_send_bsz, vector_buf_dsr);
+                    @fmovh(reduce_2nd_0_send_1, vector_buf_dsr);
                 } else {
-                    @fmovh(reduce_2nd_1_send_bsz, vector_buf_dsr);
+                    @fmovh(reduce_2nd_1_send_1, vector_buf_dsr);
                 }
             } else {
                 if (quotient_pe_id % 2 == 0) {
-                    @faddh(reduce_2nd_0_send_bsz, reduce_2nd_1_recv_bsz, vector_buf_dsr);
+                    @faddh(reduce_2nd_0_send_1, reduce_2nd_1_recv_1, vector_buf_dsr);
                 } else {
-                    @faddh(reduce_2nd_1_send_bsz, reduce_2nd_0_recv_bsz, vector_buf_dsr);
+                    @faddh(reduce_2nd_1_send_1, reduce_2nd_0_recv_1, vector_buf_dsr);
                 }
             }
         }
     } else {
         if (remainder_pe_id == root_1st_phase) {
             if (pe_id < pe_num_p_group) {
-                @fmovh(reduce_2nd_1_send_bsz, vector_buf_dsr);
+                @fmovh(reduce_2nd_1_send_1, vector_buf_dsr);
             } else {
                 if (quotient_pe_id % 2 == 0) {
-                    @faddh(reduce_2nd_1_send_bsz, reduce_2nd_0_recv_bsz, vector_buf_dsr);
+                    @faddh(reduce_2nd_1_send_1, reduce_2nd_0_recv_1, vector_buf_dsr);
                 } else {
-                    @faddh(reduce_2nd_0_send_bsz, reduce_2nd_1_recv_bsz, vector_buf_dsr);
+                    @faddh(reduce_2nd_0_send_1, reduce_2nd_1_recv_1, vector_buf_dsr);
                 }
             }
         }
@@ -631,9 +648,17 @@ fn all_reduce_bsz(pe_id: i16, quotient_pe_id: i16, remainder_pe_id: i16, vector_
 
     // Broadcast
     if (pe_id == root_2nd_phase) {
-        @mov16(bdcast_send_bsz, vector_buf_dsr);
+        @mov16(bdcast_send_1, vector_buf_dsr);
     } else {
-        @mov16(vector_buf_dsd_bsz, bdcast_recv_bsz);
+        @mov16(vector_buf_dsd_1, bdcast_recv_1);
+    }
+
+    vector_buf_dsd_1 = @increment_dsd_offset(vector_buf_dsd_1, -b, f16);   // restore offset to 0
+}
+
+fn all_reduce_bsz(pe_id: i16, quotient_pe_id: i16, remainder_pe_id: i16, vector_buf_ptr: [*]f16) void {
+    for (@range(i16, bsz)) |b| {
+        all_reduce_1(pe_id, quotient_pe_id, remainder_pe_id, vector_buf_ptr, b);
     }
 }
 
