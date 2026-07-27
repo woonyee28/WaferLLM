@@ -533,6 +533,11 @@ var z_norm_dsd = @get_dsd(mem1d_dsd, .{ .base_address = &z_norm_tile, .extent = 
 
 var Z_tile: [bsz * dim_p_pe]f16 = @zeros([bsz * dim_p_pe]f16);
 var ptr_Z: [*]f16 = &Z_tile;
+
+// resid_mid snapshot: Z right after attn_residual_add (= resid_pre + O(attn)), captured
+// before the FFN turns Z into resid_post. For transformer_lens end-to-end validation.
+var resid_mid_tile: [bsz * dim_p_pe]f16 = @zeros([bsz * dim_p_pe]f16);
+var ptr_resid_mid: [*]f16 = &resid_mid_tile;
 var Z_dsd = @get_dsd(mem1d_dsd, .{ .base_address = &Z_tile, .extent = bsz * dim_p_pe });
 
 var ptr_debug: [*]f16 = &X_tile;
@@ -1058,6 +1063,9 @@ fn decode_struct() void {
 
     attn_residual_add();
 
+    // Snapshot resid_mid (= resid_pre + O(attn)) before the FFN overwrites Z with resid_post.
+    for (@range(i16, bsz * dim_p_pe)) |i| { resid_mid_tile[i] = Z_tile[i]; }
+
     comm_mod.reconfig_allreduce_axis(1);
 
     rmsnorm_z();
@@ -1200,5 +1208,7 @@ comptime {
     @export_symbol(ptr_score_post_reduce, "score_post_reduce"); // after reduce+alpha, before softmax [bsz*max_seq_len_p_pe]
     @export_symbol(ptr_score, "score");                       // post-softmax attn [bsz*max_seq_len_p_pe]
     @export_symbol(ptr_output, "output_tile");                // post-output-matmul [bsz*dim_p_pe]
+    @export_symbol(ptr_resid_mid, "resid_mid");               // resid_pre + O(attn)  [bsz*dim_p_pe]
+    @export_symbol(ptr_Z, "resid_post");                      // full block output    [bsz*dim_p_pe]
     @export_symbol(ptr_local_sum_dbg, "local_sum_dbg");       // DBG: rmsnorm_x post-reduce sum-of-squares [bsz]
 }
