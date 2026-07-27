@@ -743,6 +743,10 @@ def main():
         print(f"\n  Hand-check: X_norm≈{xnorm:.4f}  Q[any]=dim×X_norm×W_q={dim}×{xnorm:.4f}×{args.fill}={q_exp:.4f}")
 
     Q_perm_full = (ref['X_norm'].astype(np.float32) @ W_Q_perm.astype(np.float32)).astype(np.float16)
+    # RoPE Q and the new-token K to match the kernel (Step 2c confirms the kernel ropes them).
+    # Prefill K in the cache is seeded (un-roped) in both kernel and ref -> only K_new is roped.
+    Q_rope_full = rope_csl(Q_perm_full, freqs_cos_ref, freqs_sin_ref)
+    K_new_roped = rope_csl(ref['K_new'], freqs_cos_ref[:kv_dim // 2], freqs_sin_ref[:kv_dim // 2])
 
     # ── Build per-PE reference for step 5a and 5b (Phase 3: variable iter_num, all groups) ──
     # Layout mirrors device: BATCH-OUTER [bsz, gqa_group_size, iter_num].
@@ -764,9 +768,9 @@ def main():
                     K_pe[:, s] = tensor_XKCache[b, px * kv_dim_p_pe:(px + 1) * kv_dim_p_pe, token].astype(np.float32)
                 # Decode slots: all have same K_new since X is constant across steps
                 for j in range(prefill_len_p_pe, iters):
-                    K_pe[:, j] = ref['K_new'][b, px * kv_dim_p_pe:(px + 1) * kv_dim_p_pe].astype(np.float32)
+                    K_pe[:, j] = K_new_roped[b, px * kv_dim_p_pe:(px + 1) * kv_dim_p_pe].astype(np.float32)
                 for g in range(gqa_group_size):
-                    q_g = Q_perm_full[b:b+1, px * dim_p_pe + g * kv_dim_p_pe : px * dim_p_pe + (g + 1) * kv_dim_p_pe].astype(np.float32)
+                    q_g = Q_rope_full[b:b+1, px * dim_p_pe + g * kv_dim_p_pe : px * dim_p_pe + (g + 1) * kv_dim_p_pe].astype(np.float32)
                     partial = (q_g @ K_pe).astype(np.float16)  # [1, iters]
                     base = b * gqa_group_size * iters + g * iters  # batch-outer layout
                     score_5a_ref[py, px, base : base + iters] = partial[0, :]
