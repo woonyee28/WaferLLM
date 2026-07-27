@@ -191,11 +191,17 @@ def show_all(name, grid, n=None, ref_grid=None, row_label="py"):
             print(f"{prefix} sim: [{fmt(sim_row)}]")
             print(f"{prefix} ref: [{fmt(ref_row)}]")
 
-def cmp(name, sim, ref, atol=0.15):
+def cmp(name, sim, ref, atol=0.15, rtol=2e-3):
+    # Combined absolute + magnitude-scaled tolerance (np.allclose convention).
+    # fp16 resolution is ~1 ULP = |x|/1024, so large-magnitude values (e.g. score
+    # partials ~300, where 1 ULP = 0.25) cannot pass a flat atol=0.15 no matter how
+    # correct the kernel is. rtol tracks the fp16 accumulation floor; atol covers small
+    # values. A real bug shows up as many-ULP / large relative error, still caught.
     s = sim.astype(np.float32).ravel()
     r = ref.astype(np.float32).ravel()
-    max_err = float(np.max(np.abs(s - r)))
-    ok = max_err <= atol
+    abs_err = np.abs(s - r)
+    max_err = float(np.max(abs_err)) if abs_err.size else 0.0
+    ok = bool(np.all(abs_err <= atol + rtol * np.abs(r)))
     print(f"  [{'PASS' if ok else 'FAIL'}] {name:42s}  max_err={max_err:.5f}")
     if not ok:
         print(f"         sim: {s[:6]}")
@@ -908,7 +914,7 @@ def main():
     print()
     print(f"  Steps validated (sim = WSE-3 simulator, ref = numpy reference):")
     print(f"    2a.  QKV post-proj       per-PE partial (W_Q_perm + compact K/V)")
-    print(f"    2b.  QKV post-Y-reduce   full Q/K/V (before RoPE, which is disabled)")
+    print(f"    2b.  QKV post-Y-reduce   full Q/K/V (before RoPE)")
     print(f"    5a.  Score post-GEMV     g=0 partial per PE, before KV-head-scoped reduce")
     print(f"    5b.  Score post-reduce   g=0 after KV-head-scoped X-reduce + alpha scale")
     print(f"    5c.  Attn weights        n_heads={n_heads} heads, post-softmax, seq_len={seq_len_ref}")
@@ -917,7 +923,7 @@ def main():
     print(f"  Overall: {'ALL PASS ✓' if all_ok else 'SOME FAILURES — check output above'}")
     if not all_ok:
         print()
-        print("  Tolerance: atol=0.15 (float16 matmul accumulation)")
+        print("  Tolerance: atol=0.15 + rtol=2e-3*|ref| (float16 accumulation; ~1 ULP scales with magnitude)")
         print("  If failures are near the tolerance, check for head boundary routing bugs.")
 
 if __name__ == "__main__":
