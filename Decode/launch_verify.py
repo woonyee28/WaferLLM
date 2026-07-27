@@ -168,6 +168,17 @@ def main():
     # ── Real weights ──────────────────────────────────────────────────────────
     w = load_block0_weights(head_dim, n_heads, n_kv_heads)
 
+    # Attention-only "probe" mode: if the config's ffn_dim is smaller than the real one, the
+    # FFN weights are sliced to fit (resid_mid is captured BEFORE the FFN, so it's unaffected —
+    # this lets P=32 validate the attention path without the real FFN tile overflowing i16).
+    ffn_real = w["up"].shape[1]
+    attn_only = ffn_dim < ffn_real
+    if attn_only:
+        print(f"      [PROBE] ffn_dim={ffn_dim} < real {ffn_real}: attention-only — resid_post NOT validated")
+        w["up"]   = w["up"][:, :ffn_dim]
+        w["gate"] = w["gate"][:, :ffn_dim]
+        w["down"] = w["down"][:ffn_dim, :]
+
     # Option-C GQA offline permutation on Q (columns) and O (rows); K/V unpermuted.
     W_Q_perm = np.zeros((dim, dim), dtype=np.float16)
     W_O_perm = np.zeros((dim, dim), dtype=np.float16)
@@ -284,8 +295,11 @@ def main():
     all_ok = True
     all_ok &= report("resid_mid",  kernel_mid,  o_mid)
     all_ok &= report_contrib("  attn contribution", kernel_mid,  o_mid,  o_pre)
-    all_ok &= report("resid_post", kernel_post, o_post)
-    all_ok &= report_contrib("  ffn contribution",  kernel_post, o_post, o_mid)
+    if attn_only:
+        print("  (resid_post skipped — probe FFN)")
+    else:
+        all_ok &= report("resid_post", kernel_post, o_post)
+        all_ok &= report_contrib("  ffn contribution",  kernel_post, o_post, o_mid)
     print()
     print(f"  Overall: {'ALL PASS ✓' if all_ok else 'SOME FAILURES — check above'}")
 
