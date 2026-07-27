@@ -23,11 +23,50 @@ import numpy as np
 from cerebras.sdk.client import SdkRuntime, sdk_utils
 from cerebras.appliance.pb.sdk.sdk_common_pb2 import MemcpyDataType, MemcpyOrder
 
-# Reuse the validated decode-layout NUMPY helpers from launch_sim.py (main-guarded; safe to import).
-from launch_sim import tile_kcache_interleaved, tile_vcache_interleaved, sep
-
 THETA = 500000.0  # Llama-3 RoPE base
 OUT_PATH = "compile_out"  # cloud artifacts written by `python compile.py --mode device`
+
+
+# Decode-layout NUMPY helpers, inlined from launch_sim.py so this device harness NEVER imports the
+# pybind/simfab module `cerebras.sdk.sdk_utils` (absent in the appliance venv). Mirrors Prefill's
+# standalone launch_device.py.
+def sep(title):
+    print(f"\n{'═'*64}")
+    print(f"  {title}")
+    print(f"{'═'*64}")
+
+
+def tile_kcache_interleaved(K_cache, P, bsz, kv_dim_p_pe, max_seq_len_p_pe, prefill_len_p_pe):
+    """K_cache[bsz, kv_dim, max_seq_len] -> KCache_tile[P, P, bsz*kv_dim_p_pe*max_seq_len_p_pe]
+    (round-robin interleaved: token t -> py=t%P, slot=t//P)."""
+    cache_per_pe = kv_dim_p_pe * max_seq_len_p_pe
+    tile = np.zeros((P, P, bsz * cache_per_pe), dtype=np.float16)
+    for b in range(bsz):
+        for py in range(P):
+            for px in range(P):
+                for s in range(prefill_len_p_pe):
+                    token = py + s * P
+                    k_row_start = px * kv_dim_p_pe
+                    for k in range(kv_dim_p_pe):
+                        tile[py, px, b * cache_per_pe + k * max_seq_len_p_pe + s] = \
+                            K_cache[b, k_row_start + k, token]
+    return tile
+
+
+def tile_vcache_interleaved(V_cache, P, bsz, kv_dim_p_pe, max_seq_len_p_pe, prefill_len_p_pe):
+    """V_cache[bsz, max_seq_len, kv_dim] -> VCache_tile[P, P, bsz*max_seq_len_p_pe*kv_dim_p_pe]."""
+    cache_per_pe = max_seq_len_p_pe * kv_dim_p_pe
+    tile = np.zeros((P, P, bsz * cache_per_pe), dtype=np.float16)
+    for b in range(bsz):
+        for py in range(P):
+            for px in range(P):
+                j_start = px * kv_dim_p_pe
+                j_end = (px + 1) * kv_dim_p_pe
+                for s in range(prefill_len_p_pe):
+                    token = py + s * P
+                    tile[py, px, b * cache_per_pe + s * kv_dim_p_pe:(b * cache_per_pe + (s + 1) * kv_dim_p_pe)] = \
+                        V_cache[b, token, j_start:j_end]
+    return tile
 
 
 def cast_tensor_u32(t):

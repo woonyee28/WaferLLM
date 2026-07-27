@@ -27,9 +27,8 @@ import numpy as np
 from cerebras.sdk.client import SdkRuntime
 from cerebras.appliance.pb.sdk.sdk_common_pb2 import MemcpyDataType, MemcpyOrder
 
-# Reuse the validated decode helpers (main-guarded; safe to import).
-from launch_sim import sep
-from launch_verify import load_block0_weights, report, report_contrib, cast_tensor_u32, d2h
+# Reuse the standalone decode helpers from launch_verify (which imports no pybind modules).
+from launch_verify import load_block0_weights, report, report_contrib, cast_tensor_u32, d2h, sep
 
 OUT_PATH = "compile_out"  # cloud artifacts written by `python compile.py --mode device`
 
