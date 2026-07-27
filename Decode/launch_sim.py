@@ -709,8 +709,33 @@ def main():
     all_ok &= cmp("Step2b K-reduced  sim vs ref", reduce_grid[:,:,bsz*dim_p_pe:bsz*(dim_p_pe+kv_dim_p_pe)], reduce_ref[:,:,bsz*dim_p_pe:bsz*(dim_p_pe+kv_dim_p_pe)])
     all_ok &= cmp("Step2b V-reduced  sim vs ref", reduce_grid[:,:,bsz*(dim_p_pe+kv_dim_p_pe):], reduce_ref[:,:,bsz*(dim_p_pe+kv_dim_p_pe):])
 
-    sep("Step 2c — Post-RoPE  [SKIPPED — RoPE disabled, strided-DSD @fmulh bug TBD]")
-    print("  xq_rope()/xk_rope() are no-ops; QKV_tile == post-reduce Q/K/V")
+    # Direct kernel-rope check: rope the known-correct pre-rope tensors (reduce_grid, which
+    # PASSED Step 2b) with numpy, per-PE, and compare to the kernel's post-rope qkv_grid.
+    # Isolates the kernel rope op from the score/cache/permutation (which Step 5 confounds).
+    sep("Step 2c — Post-RoPE  (kernel qkv_grid vs numpy rope of pre-rope reduce_grid)")
+    _kv_dp = kv_dim_p_pe - (kv_dim_p_pe % 2)   # even part (whole pairs)
+    def _rope_vec(v, cos, sin):
+        v = v.astype(np.float32); out = v.copy()
+        e = v[0::2]; o = v[1::2]
+        out[0::2] = o * cos - e * sin
+        out[1::2] = e * cos + o * sin
+        return out
+    qkv_rope_ref = reduce_grid.astype(np.float32).copy()
+    for py in range(P):
+        for px in range(P):
+            cos = pe_freqs_cos[px].astype(np.float32)
+            sin = pe_freqs_sin[px].astype(np.float32)
+            for b in range(bsz):
+                qs = b * dim_p_pe
+                qkv_rope_ref[py, px, qs:qs + _dim_p_pe] = _rope_vec(
+                    reduce_grid[py, px, qs:qs + _dim_p_pe], cos[:_dim_p_pe // 2], sin[:_dim_p_pe // 2])
+                ks = bsz * dim_p_pe + b * kv_dim_p_pe
+                qkv_rope_ref[py, px, ks:ks + _kv_dp] = _rope_vec(
+                    reduce_grid[py, px, ks:ks + _kv_dp], cos[:_kv_dp // 2], sin[:_kv_dp // 2])
+    all_ok &= cmp("Step2c Q-roped  sim vs ref", qkv_grid[:, :, :bsz*dim_p_pe], qkv_rope_ref[:, :, :bsz*dim_p_pe])
+    all_ok &= cmp("Step2c K-roped  sim vs ref",
+                  qkv_grid[:, :, bsz*dim_p_pe:bsz*(dim_p_pe+kv_dim_p_pe)],
+                  qkv_rope_ref[:, :, bsz*dim_p_pe:bsz*(dim_p_pe+kv_dim_p_pe)])
 
     if args.simple:
         xnorm = float(ref['X_norm'][0, 0])
