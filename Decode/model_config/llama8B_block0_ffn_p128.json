@@ -1,5 +1,5 @@
 {
-    "P": 64,
+    "P": 128,
     "group_num": 32,
     "bsz": 1,
     "dim": 4096,
@@ -7,9 +7,8 @@
     "n_kv_heads": 8,
     "head_dim": 128,
     "max_seq_len": 128,
-    "prefill_len": 64,
-    "ffn_dim": 64,
-    "ffn_only": 0,
-    "attn_only": 1,
+    "prefill_len": 0,
+    "ffn_dim": 14336,
+    "ffn_only": 1,
     "layer_num": 32
 }

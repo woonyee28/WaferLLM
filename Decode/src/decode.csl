@@ -16,6 +16,18 @@ param head_dim: i16;
 param max_seq_len_p_pe: i16;
 param prefill_len_p_pe: i16;
 param ffn_dim_p_pe: i16;
+// Disaggregated decode (mirrors Prefill's ffn_only). The full block does not fit per-PE at any
+// single P: attention needs P<=64 (head_dim/P>=2 for de-strided RoPE), the real 14336-wide FFN
+// only fits at P>=128. So the layer runs as TWO device launches at DIFFERENT mesh sizes:
+//   ffn_only==0 : ATTENTION (P=64)  resid_pre --> resid_mid, then STOP (no FFN weights resident
+//                 -> that freed SRAM is what holds a larger KV cache).
+//   ffn_only==1 : FFN (P=128)       input X is resid_mid; copy X->Z, skip attention, run the
+//                 post-attention norm + FFN --> resid_post.
+// attn_only gates the OTHER half: attn_only==1 stops the attention stage at resid_mid (no FFN
+// weights resident -> that freed SRAM holds a larger KV cache). Both 0 (the default) = the
+// original monolithic full block (attention + FFN), so existing configs/benchmarks are unchanged.
+param ffn_only: i16;
+param attn_only: i16;
 
 const _dim_p_pe: i16 = (dim_p_pe / 2) * 2;
 const _kv_dim_p_pe: i16 = (kv_dim_p_pe / 2) * 2;
@@ -538,6 +550,12 @@ var ptr_Z: [*]f16 = &Z_tile;
 // before the FFN turns Z into resid_post. For transformer_lens end-to-end validation.
 var resid_mid_tile: [bsz * dim_p_pe]f16 = @zeros([bsz * dim_p_pe]f16);
 var ptr_resid_mid: [*]f16 = &resid_mid_tile;
+
+// resid_pre echo: snapshot of the input X at decode_struct entry. An honest device read-back of
+// Z_pre (proves the block received the seeded input) rather than re-reporting the host tensor.
+var resid_pre_tile: [bsz * dim_p_pe]f16 = @zeros([bsz * dim_p_pe]f16);
+var ptr_resid_pre: [*]f16 = &resid_pre_tile;
+
 var Z_dsd = @get_dsd(mem1d_dsd, .{ .base_address = &Z_tile, .extent = bsz * dim_p_pe });
 
 var ptr_debug: [*]f16 = &X_tile;
@@ -989,9 +1007,14 @@ fn silu_kernel(val: f16) f16 {
 
 var z2_val: f16 = 0.0;
 fn z2_silu() void {
-    for (@range(i16, bsz*dim_p_pe)) |i| {
-        z2_val = ZZ_tile[i];
-        ZZ_tile[i] = z2_val / (1.0 + fast_exp(-z2_val));
+    // SwiGLU: the SiLU goes on the GATE output (z2 = ZZ_tile[bsz*ffn_dim_p_pe:]), NOT z1/up, and
+    // spans ffn_dim_p_pe (NOT dim_p_pe) elements. z3_mat then does z1*z2 = up*silu(gate), matching
+    // Prefill's validated z3_comp (silu(z2); z1*z2). Both errors were masked: launch_sim never
+    // validates the FFN, and every prior test config had dim_p_pe==ffn_dim_p_pe.
+    const z2_base: i16 = bsz * ffn_dim_p_pe;
+    for (@range(i16, bsz * ffn_dim_p_pe)) |i| {
+        z2_val = ZZ_tile[z2_base + i];
+        ZZ_tile[z2_base + i] = z2_val / (1.0 + fast_exp(-z2_val));
     }
     // @map(silu_kernel, z2_dsd, z2_dsd);
 }
@@ -1027,8 +1050,43 @@ fn ffn_residual_add() void {
     @faddh(dest_dsr_1, src0_dsr_1, src1_dsr_1);
 }
 
+// Post-attention norm + FFN, operating on Z (= resid_mid): Z <- resid_mid + mlp(norm_post(resid_mid))
+// = resid_post. Shared by the monolithic block and the disaggregated FFN stage. Assumes the
+// allreduce axis is Y on entry (attention leaves it at Y; the FFN stage sets it explicitly).
+fn ffn_block() void {
+    comm_mod.reconfig_allreduce_axis(1);   // Y
+    rmsnorm_z();
+
+    up_matvec_mult();
+    gate_matvec_mult();
+    comm_mod.all_reduce_bsz_ffn_dim_ZZ_fusion(py, quotient_y, remainder_y, ptr_ZZ_tile);
+
+    z2_silu();
+    z3_mat();
+
+    comm_mod.reconfig_allreduce_axis(0);   // X
+    down_matvec_mult();
+    ffn_residual_add();                    // Z = resid_mid + down(...) = resid_post
+
+    comm_mod.reconfig_allreduce_axis(1);   // restore Y for the next step
+}
+
 fn decode_struct() void {
 
+    // Z_pre echo (all modes): device read-back of the seeded input.
+    for (@range(i16, bsz * dim_p_pe)) |i| { resid_pre_tile[i] = X_tile[i]; }
+
+    if (ffn_only == 1) {
+        // ---- FFN stage: input X = resid_mid; skip attention, run norm_post + FFN -> resid_post -
+        @fmovh(Z_dsd, X_dsd);                                             // Z = resid_mid
+        for (@range(i16, bsz * dim_p_pe)) |i| { resid_mid_tile[i] = X_tile[i]; }  // echo the input
+        ffn_block();
+        step += 1;
+        decode_entry();
+        return;
+    }
+
+    // ---- Attention (ffn_only == 0) -----------------------------------------------------------
     rmsnorm_x();
 
     xq_matvec_mult();
@@ -1066,25 +1124,17 @@ fn decode_struct() void {
     // Snapshot resid_mid (= resid_pre + O(attn)) before the FFN overwrites Z with resid_post.
     for (@range(i16, bsz * dim_p_pe)) |i| { resid_mid_tile[i] = Z_tile[i]; }
 
-    comm_mod.reconfig_allreduce_axis(1);
+    if (attn_only == 1) {
+        // Attention stage: stop at resid_mid. No FFN weights resident (freed for KV cache); the FFN
+        // runs as a SEPARATE device launch (ffn_only==1).
+        comm_mod.reconfig_allreduce_axis(1);   // restore Y for the next step
+        step += 1;
+        decode_entry();
+        return;
+    }
 
-    rmsnorm_z();
-
-    up_matvec_mult();
-    gate_matvec_mult();
-    comm_mod.all_reduce_bsz_ffn_dim_ZZ_fusion(py, quotient_y, remainder_y, ptr_ZZ_tile);
-
-    z2_silu();
-
-    z3_mat();
-
-    comm_mod.reconfig_allreduce_axis(0);
-
-    down_matvec_mult();
-
-    ffn_residual_add();
-
-    comm_mod.reconfig_allreduce_axis(1);
+    // Monolithic full block (attn_only==0): continue into the FFN.
+    ffn_block();
 
     step += 1;
 
@@ -1208,6 +1258,7 @@ comptime {
     @export_symbol(ptr_score_post_reduce, "score_post_reduce"); // after reduce+alpha, before softmax [bsz*max_seq_len_p_pe]
     @export_symbol(ptr_score, "score");                       // post-softmax attn [bsz*max_seq_len_p_pe]
     @export_symbol(ptr_output, "output_tile");                // post-output-matmul [bsz*dim_p_pe]
+    @export_symbol(ptr_resid_pre, "resid_pre");               // input echo (Z_pre)   [bsz*dim_p_pe]
     @export_symbol(ptr_resid_mid, "resid_mid");               // resid_pre + O(attn)  [bsz*dim_p_pe]
     @export_symbol(ptr_Z, "resid_post");                      // full block output    [bsz*dim_p_pe]
     @export_symbol(ptr_local_sum_dbg, "local_sum_dbg");       // DBG: rmsnorm_x post-reduce sum-of-squares [bsz]

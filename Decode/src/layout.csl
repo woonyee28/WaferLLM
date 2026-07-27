@@ -25,6 +25,8 @@ param head_dim: i16;
 param max_seq_len_p_pe: i16;
 param prefill_len_p_pe: i16;
 param ffn_dim_p_pe: i16;
+param ffn_only: i16;   // 1 = FFN stage (resid_mid -> resid_post); 0 = attention/monolith
+param attn_only: i16;  // 1 = attention stage stops at resid_mid; both 0 = monolithic full block
 
 param pe_num_p_group: i16;
 param root_1st_phase: i16;
@@ -89,6 +91,8 @@ layout {
                 .max_seq_len_p_pe = max_seq_len_p_pe,
                 .prefill_len_p_pe = prefill_len_p_pe,
                 .ffn_dim_p_pe = ffn_dim_p_pe,
+                .ffn_only = ffn_only,
+                .attn_only = attn_only,
 
                 .pe_num_p_group = pe_num_p_group,
                 .root_1st_phase = root_1st_phase,
@@ -128,6 +132,7 @@ layout {
     @export_name("score_post_reduce", [*]f16, true);
     @export_name("score",           [*]f16, true);
     @export_name("output_tile",     [*]f16, true);
+    @export_name("resid_pre",       [*]f16, true);
     @export_name("resid_mid",       [*]f16, true);
     @export_name("resid_post",      [*]f16, true);
     @export_name("local_sum_dbg",   [*]f16, true);

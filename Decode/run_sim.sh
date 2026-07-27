@@ -20,6 +20,8 @@ if [ -f $CONFIG ]; then
     MAX_SEQ_LEN=$(jq -r '.max_seq_len' $CONFIG)
     PREFILL_LEN=$(jq -r '.prefill_len' $CONFIG)
     FFN_DIM=$(jq -r '.ffn_dim' $CONFIG)
+    FFN_ONLY=$(jq -r '.ffn_only // 0' $CONFIG)
+    ATTN_ONLY=$(jq -r '.attn_only // 0' $CONFIG)
 else
     echo "Use default test values."
     P=8
@@ -32,6 +34,8 @@ else
     MAX_SEQ_LEN=128
     PREFILL_LEN=64
     FFN_DIM=64
+    FFN_ONLY=0
+    ATTN_ONLY=0
 fi
 
 FABRIC_W=$(($P + 7))
@@ -90,7 +94,7 @@ if [ $(( MAX_SEQ_LEN % P )) -ne 0 ]; then
 fi
 
 cslc --arch=wse3 ./src/layout.csl --fabric-dims="$FABRIC_W","$FABRIC_H" --fabric-offsets=4,1 \
-    --params=P:"$P",bsz:"$BSZ",dim_p_pe:"$dim_p_pe",kv_dim_p_pe:"$kv_dim_p_pe",pes_p_head:"$pes_p_head",pes_p_kv_head:"$pes_p_kv_head",head_dim_p_pe:"$head_dim_p_pe",head_dim:"$HEAD_DIM",max_seq_len_p_pe:"$max_seq_len_p_pe",prefill_len_p_pe:"$prefill_len_p_pe",ffn_dim_p_pe:"$ffn_dim_p_pe",pe_num_p_group:"$pe_num_p_group",root_1st_phase:"$root_1st_phase",root_2nd_phase:"$root_2nd_phase" \
+    --params=P:"$P",bsz:"$BSZ",dim_p_pe:"$dim_p_pe",kv_dim_p_pe:"$kv_dim_p_pe",pes_p_head:"$pes_p_head",pes_p_kv_head:"$pes_p_kv_head",head_dim_p_pe:"$head_dim_p_pe",head_dim:"$HEAD_DIM",max_seq_len_p_pe:"$max_seq_len_p_pe",prefill_len_p_pe:"$prefill_len_p_pe",ffn_dim_p_pe:"$ffn_dim_p_pe",ffn_only:"$FFN_ONLY",attn_only:"$ATTN_ONLY",pe_num_p_group:"$pe_num_p_group",root_1st_phase:"$root_1st_phase",root_2nd_phase:"$root_2nd_phase" \
     -o out --memcpy --channels 1
 
 cs_python launch_sim.py --config $CONFIG "${@:2}"

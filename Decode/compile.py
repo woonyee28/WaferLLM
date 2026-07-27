@@ -37,6 +37,10 @@ def main():
     pe_num_p_group = P // group_num
     root_1st_phase = pe_num_p_group // 2
     root_2nd_phase = (group_num // 2) * pe_num_p_group + root_1st_phase
+    # Disaggregated decode: ffn_only=1 -> FFN stage; attn_only=1 -> attention stage stops at
+    # resid_mid; both 0 (default) -> monolithic full block (backward compatible).
+    ffn_only = config.get("ffn_only", 0)
+    attn_only = config.get("attn_only", 0)
 
     if simulator:
         fabric_w = P + 7
@@ -53,7 +57,7 @@ def main():
         f"pes_p_head:{pes_p_head},pes_p_kv_head:{pes_p_kv_head},"
         f"head_dim_p_pe:{head_dim_p_pe},head_dim:{head_dim},"
         f"max_seq_len_p_pe:{max_seq_len_p_pe},prefill_len_p_pe:{prefill_len_p_pe},"
-        f"ffn_dim_p_pe:{ffn_dim_p_pe},"
+        f"ffn_dim_p_pe:{ffn_dim_p_pe},ffn_only:{ffn_only},attn_only:{attn_only},"
         f"pe_num_p_group:{pe_num_p_group},"
         f"root_1st_phase:{root_1st_phase},root_2nd_phase:{root_2nd_phase}"
     )

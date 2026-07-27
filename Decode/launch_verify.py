@@ -112,6 +112,8 @@ def parse_args():
     ap.add_argument("--config", default="model_config/llama8B_block0_p32.json")
     ap.add_argument("--oracle-dir", default=None, help="dir with resid_*_block0.npy + k/v_cache (default: <repo>/pytorch/oracle_decode)")
     ap.add_argument("--cmaddr", default=None, help="CM address for WSE-3 hardware (else simulator)")
+    ap.add_argument("--save-zmid", default="csl_decode_zmid.npy",
+                    help="path to write the DEVICE resid_mid (Z_mid), threaded into the FFN stage")
     return ap.parse_args()
 
 
@@ -274,6 +276,7 @@ def main():
     runner.launch("init_task", nonblock=False)
     runner.launch("decode_host", np.int16(1), np.int16(0), nonblock=False)   # 1 decode step, 0 warmup
 
+    pre_grid  = d2h(runner, runner.get_id("resid_pre"),  P, bsz, dim_p_pe, io_dtype, memcpy_order)
     mid_grid  = d2h(runner, runner.get_id("resid_mid"),  P, bsz, dim_p_pe, io_dtype, memcpy_order)
     post_grid = d2h(runner, runner.get_id("resid_post"), P, bsz, dim_p_pe, io_dtype, memcpy_order)
     runner.stop()
@@ -285,22 +288,29 @@ def main():
             out[py * dim_p_pe:(py + 1) * dim_p_pe] = grid[py, 0, :].astype(np.float32)
         return out
 
+    kernel_pre  = reconstruct(pre_grid)
     kernel_mid  = reconstruct(mid_grid)
     kernel_post = reconstruct(post_grid)
     o_pre  = resid_pre[prefill_len]
     o_mid  = resid_mid[prefill_len]
     o_post = resid_post[prefill_len]
 
+    # Hand the DEVICE resid_mid to the FFN stage (launch_layer_verify chains this .npy). fp16 to
+    # preserve exactly what the device produced (no host re-rounding).
+    np.save(args.save_zmid, kernel_mid.astype(np.float16))
+
     sep(f"transformer_lens validation — decode step at position {prefill_len}")
     all_ok = True
+    all_ok &= report("resid_pre (Z_pre echo)", kernel_pre, o_pre)
     all_ok &= report("resid_mid",  kernel_mid,  o_mid)
     all_ok &= report_contrib("  attn contribution", kernel_mid,  o_mid,  o_pre)
     if attn_only:
-        print("  (resid_post skipped — probe FFN)")
+        print("  (resid_post skipped — attention stage; FFN runs as a separate P=128 launch)")
     else:
         all_ok &= report("resid_post", kernel_post, o_post)
         all_ok &= report_contrib("  ffn contribution",  kernel_post, o_post, o_mid)
     print()
+    print(f"  device Z_mid saved -> {args.save_zmid}")
     print(f"  Overall: {'ALL PASS ✓' if all_ok else 'SOME FAILURES — check above'}")
 
 
