@@ -543,16 +543,16 @@ var ptr_debug: [*]f16 = &X_tile;
 // -------------------------------------------------------------------------- //
 
 fn rmsnorm_x() void {
-    @load_to_dsr(dest_dsr_1, X_tmp_dsd);
-    @load_to_dsr(src0_dsr_1, X_dsd);
-    @load_to_dsr(src1_dsr_1, X_dsd);
-    @fmulh(dest_dsr_1, src0_dsr_1, src1_dsr_1);
-
-    dim_p_pe_dsd_1 = @set_dsd_base_addr(dim_p_pe_dsd_1, ptr_X_tmp);
-    @load_to_dsr(src1_dsr_1, dim_p_pe_dsd_1, .{ .save_address = true });
+    // Per-batch sum of squares, explicit scalar accumulation. The prior save_address DSR
+    // reduce (@faddh(ptr_sum,sum,dsr)) miscounted batch 0's extent at bsz>1 (summed 1 of
+    // dim_p_pe dims -> batch-0 halving). Explicit indexing is unambiguous.
+    var xv: f16 = 0.0;
     for (@range(i16, bsz)) |b| {
         sum = 0.0;
-        @faddh(ptr_sum, sum, src1_dsr_1);
+        for (@range(i16, dim_p_pe)) |i| {
+            xv = X_tile[b * dim_p_pe + i];
+            sum += xv * xv;
+        }
         local_sum[b] = sum;
     }
 
