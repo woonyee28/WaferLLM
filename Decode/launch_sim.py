@@ -606,8 +606,8 @@ def main():
 
         # ── DBG: rmsnorm_x post-reduce sum-of-squares per batch (localize the bsz>1 halving) ──
         ls_grid  = d2h(runner, sym_local_sum_dbg, P, 1, bsz, io_dtype, memcpy_order)   # [P, P, bsz]
-        ls_expect = np.sum(X_raw.reshape(bsz, dim).astype(np.float32) ** 2, axis=1)     # [bsz] full-dim sum of X^2
-        sep("DBG — rmsnorm_x post-reduce local_sum  (should equal sum_d X[b,d]^2 per batch)")
+        ls_expect = np.sum(X_raw.reshape(bsz, dim).astype(np.float32) ** 2, axis=1) / P  # per-PE partial (pre-reduce)
+        sep("DBG — rmsnorm_x PRE-reduce per-PE local_sum partial  (should equal sum_d X[b,d]^2 / P)")
         print(f"  expected per batch : {[round(float(v), 5) for v in ls_expect]}")
         for _py in range(min(P, 2)):
             for _px in range(min(P, 2)):

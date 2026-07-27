@@ -556,9 +556,9 @@ fn rmsnorm_x() void {
         local_sum[b] = sum;
     }
 
-    comm_mod.all_reduce_bsz(py, quotient_y, remainder_y, ptr_local_sum);
+    for (@range(i16, bsz)) |b| { local_sum_dbg[b] = local_sum[b]; }   // DBG: PRE-reduce per-PE partial
 
-    for (@range(i16, bsz)) |b| { local_sum_dbg[b] = local_sum[b]; }   // DBG: post-reduce sum-of-squares
+    comm_mod.all_reduce_bsz(py, quotient_y, remainder_y, ptr_local_sum);
 
     dim_p_pe_dsd_1 = @set_dsd_base_addr(dim_p_pe_dsd_1, ptr_X_norm);
     dim_p_pe_dsd_2 = @set_dsd_base_addr(dim_p_pe_dsd_2, ptr_X);   // X, not X_tmp(=X^2): RMSNorm numerator is X
