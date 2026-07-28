@@ -651,7 +651,11 @@ fn xv_matvec_mult() void {
 // De-strided RoPE. The old version used odd-offset strided DSDs whose @fmulh
 // writes silently drop on wse3 (they zeroed the odd lane -> group-0 Q). Here each
 // (even,odd) pair is rotated with plain scalar indexing, so no strided write is used.
-//   even' = odd*cos - even*sin ,  odd' = even*cos + odd*sin   (matches rope_csl).
+//   Per rope_perm, even (2i) holds the HF second-half component x2 and odd (2i+1) the first-half x1,
+//   so HF rotate-half is  even' = x2*cos + x1*sin = e*cos + o*sin ,  odd' = x1*cos - x2*sin = o*cos - e*sin.
+//   (The earlier even'=o*cos-e*sin / odd'=e*cos+o*sin wrote the two results into SWAPPED slots, which
+//    transposed the head halves -> post-rope Q/K near-orthogonal to HF; the simulator missed it because
+//    launch_sim's numpy oracle replays the same swapped convention. Localized via --dump-intermediates.)
 var rope_e: f16 = 0.0;
 var rope_o: f16 = 0.0;
 fn xq_rope() void {
@@ -662,8 +666,8 @@ fn xq_rope() void {
         for (@range(i16, npairs)) |i| {
             rope_e = QKV_tile[base + 2 * i];
             rope_o = QKV_tile[base + 2 * i + 1];
-            QKV_tile[base + 2 * i]     = rope_o * freqs_cos[i] - rope_e * freqs_sin[i];
-            QKV_tile[base + 2 * i + 1] = rope_e * freqs_cos[i] + rope_o * freqs_sin[i];
+            QKV_tile[base + 2 * i]     = rope_e * freqs_cos[i] + rope_o * freqs_sin[i];
+            QKV_tile[base + 2 * i + 1] = rope_o * freqs_cos[i] - rope_e * freqs_sin[i];
         }
     }
 }
@@ -680,8 +684,8 @@ fn xk_rope() void {
         for (@range(i16, npairs)) |i| {
             rope_e = QKV_tile[base + 2 * i];
             rope_o = QKV_tile[base + 2 * i + 1];
-            QKV_tile[base + 2 * i]     = rope_o * freqs_cos[i] - rope_e * freqs_sin[i];
-            QKV_tile[base + 2 * i + 1] = rope_e * freqs_cos[i] + rope_o * freqs_sin[i];
+            QKV_tile[base + 2 * i]     = rope_e * freqs_cos[i] + rope_o * freqs_sin[i];
+            QKV_tile[base + 2 * i + 1] = rope_o * freqs_cos[i] - rope_e * freqs_sin[i];
         }
     }
 }
