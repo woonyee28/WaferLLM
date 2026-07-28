@@ -97,6 +97,18 @@ def rope_perm_idx(D):
     return p
 
 
+def rope_hf(x, pos, theta=THETA):
+    """HF rotate-half RoPE on x[..., head_dim] at scalar position `pos` (same as verify_numpy)."""
+    hd = x.shape[-1]; half = hd // 2
+    inv = theta ** (-2.0 * np.arange(half) / hd)
+    ang = pos * inv
+    cos_f = np.concatenate([np.cos(ang), np.cos(ang)])
+    sin_f = np.concatenate([np.sin(ang), np.sin(ang)])
+    x1, x2 = x[..., :half], x[..., half:]
+    rot = np.concatenate([-x2, x1], axis=-1)
+    return x * cos_f + rot * sin_f
+
+
 def load_block0_weights(head_dim, n_heads, n_kv_heads):
     """HF Linear stores [out, in] and applies x@W.T; WaferLLM does x@W, so 2-D weights are
     transposed. q/k get rope_perm (HF rotate-half -> kernel adjacent pairs); 1-D norms as-is."""
@@ -137,6 +149,26 @@ def load_block0_weights(head_dim, n_heads, n_kv_heads):
     }
 
 
+def load_raw_attn_weights():
+    """Raw HF block-0 attention weights (NO rope_perm, NO transpose) as fp32 — the head-space
+    ground truth for --dump-intermediates, exactly as verify_numpy loads them. HF stores [out,in]
+    and applies y = x @ W.T; norm is 1-D."""
+    import torch
+    from safetensors import safe_open
+    hf_home = os.environ.get("HF_HOME", os.path.expanduser("~/.cache/huggingface"))
+    model_dir = os.path.join(hf_home, "hub", "models--meta-llama--Meta-Llama-3-8B")
+    prefix = "model.layers.0."
+    want = {"q": "self_attn.q_proj.weight", "k": "self_attn.k_proj.weight",
+            "v": "self_attn.v_proj.weight", "norm": "input_layernorm.weight"}
+    raw = {}
+    for shard in sorted(glob.glob(os.path.join(model_dir, "**", "*.safetensors"), recursive=True)):
+        with safe_open(shard, framework="pt") as f:
+            for name in f.keys():
+                if name.startswith(prefix):
+                    raw[name] = f.get_tensor(name).to(torch.float32).cpu().numpy()
+    return {k: raw[prefix + s] for k, s in want.items()}
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Reporting (cosine; contribution cosine strips the residual passthrough)
 # ─────────────────────────────────────────────────────────────────────────────
@@ -172,6 +204,12 @@ def parse_args():
                     help="run the cloud artifact in the appliance SIMULATOR (default: real WSE-3)")
     ap.add_argument("--save-zmid", default="csl_decode_zmid.npy",
                     help="path to write the DEVICE resid_mid (Z_mid), threaded into the FFN stage")
+    ap.add_argument("--dump-intermediates", action="store_true",
+                    help="read back the kernel's per-PE attention intermediates, un-tile them to "
+                         "head-space, and compare stage-by-stage to the trusted reference (localizes "
+                         "a per-PE/tiling/kernel bug: first stage to diverge names it)")
+    ap.add_argument("--dump-dir", default="dump_intermediates",
+                    help="dir to save raw grids + reconstructs + references as .npy (for forensics)")
     return ap.parse_args()
 
 
@@ -335,6 +373,18 @@ def main():
         mid_grid  = d2h(runner, runner.get_id("resid_mid"),  P, bsz, dim_p_pe, io_dtype, memcpy_order)
         post_grid = d2h(runner, runner.get_id("resid_post"), P, bsz, dim_p_pe, io_dtype, memcpy_order)
 
+        # Per-PE attention intermediates (only when localizing). Reduced/broadcast buffers
+        # (QKV_*, output_tile) are read at any py; score buffers keep per-py token rows.
+        dump = {}
+        if args.dump_intermediates:
+            qkv_wide = dim_p_pe + 2 * kv_dim_p_pe                 # Q(dim_p_pe) K/V(kv_dim_p_pe each)
+            score_wide = gqa_group_size * max_seq_len_p_pe
+            dump["QKV_post_reduce"] = d2h(runner, runner.get_id("QKV_post_reduce"), P, bsz, qkv_wide, io_dtype, memcpy_order)
+            dump["QKV_tile"]        = d2h(runner, runner.get_id("QKV_tile"),        P, bsz, qkv_wide, io_dtype, memcpy_order)
+            dump["score_post_reduce"] = d2h(runner, runner.get_id("score_post_reduce"), P, bsz, score_wide, io_dtype, memcpy_order)
+            dump["score"]           = d2h(runner, runner.get_id("score"),           P, bsz, score_wide, io_dtype, memcpy_order)
+            dump["output_tile"]     = d2h(runner, runner.get_id("output_tile"),     P, bsz, dim_p_pe, io_dtype, memcpy_order)
+
     # Residual stream is dim-block by py, replicated across px -> gather py, use px=0.
     def reconstruct(grid):
         out = np.zeros(P * dim_p_pe, dtype=np.float32)
@@ -366,6 +416,101 @@ def main():
     print()
     print(f"  device Z_mid saved -> {args.save_zmid}")
     print(f"  Overall: {'ALL PASS ✓' if all_ok else 'SOME FAILURES — check above'}")
+
+    # ── Localization: un-tile the kernel's attention intermediates to head-space & compare ──
+    # verify_numpy already proved the head-space CONVENTIONS are right, so a device failure is a
+    # per-PE tiling / freq-layout / kernel bug. Reconstruct each exported intermediate back to
+    # head-space and compare in PIPELINE ORDER — the first stage to diverge is where it breaks.
+    if args.dump_intermediates:
+        sep(f"per-PE intermediate localization — decode step at position {prefill_len}")
+        pos = prefill_len
+        iter_num = pos // P + 1                        # cache slots in use (batch-outer score stride)
+        kperm = rope_perm_idx(head_dim)                # kernel adjacent-pair col k -> HF col kperm[k]
+
+        # Trusted head-space reference (raw weights + oracle cache; identical math to verify_numpy).
+        rw = load_raw_attn_weights()
+        x0 = resid_pre[pos].astype(np.float64)
+        xn = x0 / np.sqrt(np.mean(x0 ** 2) + 1e-5) * rw["norm"].astype(np.float64)
+        Q_hf = (xn @ rw["q"].T.astype(np.float64)).reshape(n_heads, head_dim)
+        K_hf = (xn @ rw["k"].T.astype(np.float64)).reshape(n_kv_heads, head_dim)
+        V_hf = (xn @ rw["v"].T.astype(np.float64)).reshape(n_kv_heads, head_dim)
+        Qr_hf, Kr_hf = rope_hf(Q_hf, pos), rope_hf(K_hf, pos)
+        K_all = k_cache[:pos + 1].astype(np.float64)   # oracle post-rope K [pos+1, n_kv, head_dim]
+        V_all = v_cache[:pos + 1].astype(np.float64)
+        scale = 1.0 / np.sqrt(head_dim)
+        logits_ref = np.zeros((n_heads, pos + 1)); attn_ref = np.zeros((n_heads, pos + 1))
+        out_ref = np.zeros((n_heads, head_dim))
+        for h in range(n_heads):
+            kv = h // gqa_group_size
+            s = (Qr_hf[h] @ K_all[:, kv].T) * scale
+            logits_ref[h] = s
+            e = np.exp(s - s.max()); attn_ref[h] = e / e.sum()
+            out_ref[h] = attn_ref[h] @ V_all[:, kv]
+
+        # Reconstruct = invert the exact host tiling (Q via Option-C W_Q_perm; K/V plain row-tile;
+        # score via the token interleave py=t%P, slot=t//P; output via Option-C group-inner layout).
+        def gather_cols(grid, offset, width):          # reduced/broadcast buffer: any py (use 0)
+            v = np.zeros(P * width, dtype=np.float32)
+            for px in range(P):
+                v[px * width:(px + 1) * width] = grid[0, px, offset:offset + width].astype(np.float32)
+            return v
+
+        def invert_optionC(q_perm):                    # W_Q_perm output-col space -> kernel-pair [dim]
+            qk = np.zeros(dim, dtype=np.float32)
+            for h in range(n_heads):
+                kv_head = h // gqa_group_size; g = h % gqa_group_size
+                for s in range(pes_p_kv_head):
+                    old = h * head_dim + s * kv_dim_p_pe
+                    new = kv_head * pes_p_kv_head * dim_p_pe + s * dim_p_pe + g * kv_dim_p_pe
+                    qk[old:old + kv_dim_p_pe] = q_perm[new:new + kv_dim_p_pe]
+            return qk
+
+        def kern_to_hf(vec, n):                         # kernel adjacent-pair order -> HF order
+            v = vec.reshape(n, head_dim); out = np.zeros_like(v); out[:, kperm] = v; return out
+
+        def recon_Q(grid): return kern_to_hf(invert_optionC(gather_cols(grid, 0, dim_p_pe)), n_heads)
+        def recon_K(grid): return kern_to_hf(gather_cols(grid, dim_p_pe, kv_dim_p_pe), n_kv_heads)
+        def recon_V(grid): return gather_cols(grid, dim_p_pe + kv_dim_p_pe, kv_dim_p_pe).reshape(n_kv_heads, head_dim)
+
+        def recon_output(grid):                         # Option-C group-inner: PE px=(kv_head,s), block g
+            out = np.zeros((n_heads, head_dim), dtype=np.float32)
+            for px in range(P):
+                kv_head = px // pes_p_kv_head; s = px % pes_p_kv_head
+                for g in range(gqa_group_size):
+                    h = kv_head * gqa_group_size + g
+                    out[h, s * kv_dim_p_pe:(s + 1) * kv_dim_p_pe] = \
+                        grid[0, px, g * kv_dim_p_pe:(g + 1) * kv_dim_p_pe].astype(np.float32)
+            return out
+
+        def recon_scores(grid):                         # -> [n_heads, pos+1]; token t on py=t%P, slot=t//P
+            out = np.zeros((n_heads, pos + 1), dtype=np.float32)
+            for h in range(n_heads):
+                kv_head = h // gqa_group_size; g = h % gqa_group_size
+                px = kv_head * pes_p_kv_head            # score broadcast across kv-head's px range
+                for t in range(pos + 1):
+                    out[h, t] = grid[t % P, px, g * iter_num + (t // P)].astype(np.float32)
+            return out
+
+        d_ok = True
+        d_ok &= report("QKV_post_reduce Q (proj)",   recon_Q(dump["QKV_post_reduce"]), Q_hf)
+        d_ok &= report("QKV_post_reduce K (proj)",   recon_K(dump["QKV_post_reduce"]), K_hf)
+        d_ok &= report("QKV_post_reduce V (proj)",   recon_V(dump["QKV_post_reduce"]), V_hf)
+        d_ok &= report("QKV_tile Q (post-rope)",     recon_Q(dump["QKV_tile"]),        Qr_hf)
+        d_ok &= report("QKV_tile K (post-rope)",     recon_K(dump["QKV_tile"]),        Kr_hf)
+        d_ok &= report("score_post_reduce (logits)", recon_scores(dump["score_post_reduce"]), logits_ref)
+        d_ok &= report("score (softmax)",            recon_scores(dump["score"]),      attn_ref)
+        d_ok &= report("output_tile (attn·V)",       recon_output(dump["output_tile"]), out_ref)
+
+        os.makedirs(args.dump_dir, exist_ok=True)
+        for k, v in dump.items():
+            np.save(os.path.join(args.dump_dir, f"raw_{k}.npy"), v)
+        for nm, arr in {"Q": Q_hf, "K": K_hf, "V": V_hf, "Qr": Qr_hf, "Kr": Kr_hf,
+                        "logits": logits_ref, "attn": attn_ref, "output": out_ref}.items():
+            np.save(os.path.join(args.dump_dir, f"ref_{nm}.npy"), arr)
+        print(f"\n  raw grids + references saved -> {args.dump_dir}/")
+        print("  Localization: " + ("all attention stages reconstruct correctly — bug is downstream "
+              "(o_proj W_O_perm tiling / residual add)" if d_ok else
+              "first FAIL above = the diverging stage (that host-prep tiling or kernel step is the bug)"))
 
 
 if __name__ == "__main__":
