@@ -381,6 +381,7 @@ def main():
             score_wide = gqa_group_size * max_seq_len_p_pe
             dump["QKV_post_reduce"] = d2h(runner, runner.get_id("QKV_post_reduce"), P, bsz, qkv_wide, io_dtype, memcpy_order)
             dump["QKV_tile"]        = d2h(runner, runner.get_id("QKV_tile"),        P, bsz, qkv_wide, io_dtype, memcpy_order)
+            dump["score_post_gemv"]   = d2h(runner, runner.get_id("score_post_gemv"),   P, bsz, score_wide, io_dtype, memcpy_order)
             dump["score_post_reduce"] = d2h(runner, runner.get_id("score_post_reduce"), P, bsz, score_wide, io_dtype, memcpy_order)
             dump["score"]           = d2h(runner, runner.get_id("score"),           P, bsz, score_wide, io_dtype, memcpy_order)
             dump["output_tile"]     = d2h(runner, runner.get_id("output_tile"),     P, bsz, dim_p_pe, io_dtype, memcpy_order)

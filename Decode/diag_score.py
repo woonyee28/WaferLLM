@@ -74,6 +74,36 @@ def main():
     print(f"    head-0 softmax argmax: dev={dev_sm[0].argmax()}  ref={ref_attn[0].argmax()}")
     print(f"    head-1 softmax argmax: dev={dev_sm[1].argmax()}  ref={ref_attn[1].argmax()}")
 
+    # [5] Pre-reduce partials: manually sum the pes_p_kv_head segments ourselves. If that matches the
+    # reference, the GEMV is correct and the on-device kv-head REDUCE is the bug. Also test whether the
+    # device's g>0 result is just the base-PE (segment-0) partial (i.e. the reduce didn't sum groups 1+).
+    gemv_path = os.path.join(D, "raw_score_post_gemv.npy")
+    if os.path.exists(gemv_path):
+        spg = np.load(gemv_path).astype(np.float64)          # [P,P,8] partials, pre-reduce
+        alpha = 1.0 / np.sqrt(head_dim)
+        man = np.zeros((n_heads, pos + 1))                   # our own full sum over segments
+        seg0 = np.zeros((n_heads, pos + 1))                  # base-PE (segment 0) partial only
+        for h in range(n_heads):
+            kvh, g = h // gqa, h % gqa
+            for t in range(pos + 1):
+                py, slot = t % P, t // P
+                man[h, t] = alpha * sum(spg[py, kvh * pes_p_kv_head + s, g * iter_num + slot]
+                                        for s in range(pes_p_kv_head))
+                seg0[h, t] = alpha * spg[py, kvh * pes_p_kv_head + 0, g * iter_num + slot]
+        cm = np.array([cos_(man[h], ref_logits[h]) for h in range(n_heads)])
+        print(f"\n[5] MANUAL segment-sum of score_post_gemv vs ref logits: "
+              f"min={cm.min():.3f} mean={cm.mean():.3f} max={cm.max():.3f}  | >0.99: {(cm > 0.99).sum()}/{n_heads}")
+        print("    (all ~1.0 => GEMV partials are correct => the kv-head REDUCE is the bug)")
+        print("    per-GQA-group: cos(device post_reduce, our full sum) & cos(device, base-seg0-only):")
+        for g in range(gqa):
+            hs = [h for h in range(n_heads) if h % gqa == g]
+            dev = np.concatenate([dev_logits[h] for h in hs])
+            print(f"      g={g}:  cos(dev, full)={cos_(dev, np.concatenate([man[h] for h in hs])):+.3f}"
+                  f"   cos(dev, seg0)={cos_(dev, np.concatenate([seg0[h] for h in hs])):+.3f}")
+    else:
+        print("\n[5] (raw_score_post_gemv.npy not found — re-run run_verify.sh --dump-intermediates "
+              "after pulling to capture the pre-reduce partials)")
+
 
 if __name__ == "__main__":
     main()
