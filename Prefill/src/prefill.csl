@@ -67,6 +67,17 @@ var tscStartBuffer = @zeros([timestamp.tsc_size_words]u16);
 // ending time of H2D/D2H
 var tscEndBuffer = @zeros([timestamp.tsc_size_words]u16);
 
+// add per stage timing buffer to record their respective cycles
+const tsw: i16 = @as(i16, timestamp.tsc_size_words); // 3 16-bit words for each timestamp
+
+// 18 stage timing buffer to be recorded
+var stage_tsc = @zeros([18 * timestamp.tsc_size_words]u16);
+var stage_scratch = @zeros([timestamp.tsc_size_words]u16);
+
+// 18 x 3 == 54 i16 == 27 f32
+var stage_time_f32 = @zeros([27]f32);
+var ptr_stage_time: [*]f32 = &stage_time_f32;
+
 var time_buf_f32 = @zeros([3]f32);
 var ptr_time_memcpy: [*]f32 = &time_buf_f32;
 
@@ -94,6 +105,13 @@ fn init_task() void {
     alpha = 1.0 / @as(f16, math_lib.sqrt(head_dim));
 
     sys_mod.unblock_cmd_stream();
+}
+
+fn mark(slot: i16) void{
+    timestamp.get_timestamp(&stage_scratch); // read the current time
+    for (@range(i16, tsw)) |i| {
+        stage_tsc[slot * tsw + i] = stage_scratch[i]; // write the timestamp to the corresponding slot
+    }
 }
 
 // * X: input
@@ -946,6 +964,7 @@ fn add_result() void {
 // comm finish tasks), so the stages run in order without explicit chaining here.
 var flag: i16 = 0;
 fn prefill_struct() void {
+    mark(flag);
     if (flag == 0) {
         flag += 1;
         rmsnorm_x();
@@ -996,6 +1015,7 @@ fn prefill_struct() void {
         h2_matmul();
     } else {
         add_result();
+        mark(17);
         prefill_entry();
     }
 }
@@ -1039,6 +1059,7 @@ fn exit() void {
 
     f_reference_timestamps();
     f_memcpy_timestamps();
+    f_stage_timestamps();
     sys_mod.unblock_cmd_stream();
 }
 
@@ -1073,9 +1094,18 @@ fn f_reference_timestamps() void {
     time_ref_f32[1] = @bitcast(f32, (@as(u32,hi_) << @as(u16,16)) | @as(u32, lo_) );
 }
 
+fn f_stage_timestamps() void {
+    for (@range(i16, 27)) |i| {
+        var lo_: u16 = stage_tsc[2*i];
+        var hi_: u16 = stage_tsc[2*i + 1];
+        stage_time_f32[i] = @bitcast(f32, (@as(u32,hi_) << @as(u16,16)) | @as(u32, lo_) );
+    }
+}
+
 comptime {
     @export_symbol(ptr_time_memcpy, "time_memcpy");
     @export_symbol(ptr_time_ref, "time_ref");
+    @export_symbol(ptr_stage_time, "stage_time");
 }
 
 comptime {

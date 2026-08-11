@@ -9,6 +9,17 @@ from cerebras.appliance.pb.sdk.sdk_common_pb2 import MemcpyDataType, MemcpyOrder
 
 out_path = "compile_out"
 
+# stages dispatched by prefill_struct(), in `flag` order (0..15 plus the else tail).
+# 17 stages -> 18 boundary timestamps -> 17 deltas.
+stages = [
+    "rmsnorm_x", "xq_matmul", "xk_matmul", "xv_matmul", "xq_rope", "xk_rope",
+    "score_matmul", "softmax_score", "output_matmul", "h1_matmul", "z_add",
+    "rmsnorm_z", "z1_matmul", "z2_matmul", "z3_comp", "h2_matmul", "add_result",
+]
+
+n_bounds = 18
+stage_f32 = n_bounds * 3 // 2  # 3 u16 per timestamp, packed 2 u16 per f32
+
 def float_to_hex(f):
     return hex(struct.unpack("<I", struct.pack("<f", f))[0])
 
@@ -172,6 +183,7 @@ def main():
         
         symbol_time_memcpy = runner.get_id("time_memcpy")
         symbol_time_ref = runner.get_id("time_ref")
+        symbol_stage_time = runner.get_id("stage_time")
         
         Xc1 = tensor_X.reshape(P, seq_len_p_pe, P, dim_p_pe)
         Xc2 = Xc1.transpose(0, 2, 3, 1)
@@ -264,7 +276,13 @@ def main():
         runner.memcpy_d2h(time_ref_1d_f32, symbol_time_ref, 0, 0, P, P, 2, streaming=False,
                         order=MemcpyOrder.ROW_MAJOR, data_type=MemcpyDataType.MEMCPY_32BIT, nonblock=False)
         time_ref_hwl = np.reshape(time_ref_1d_f32, (P, P, 2), order='C')
-        
+
+        # Per-stage boundary timestamps. stage_tsc is overwritten every pass, so
+        # what survives is the final (fully warmed) pass.
+        stage_1d_f32 = np.zeros(P*P*stage_f32, dtype=np.float32)
+        runner.memcpy_d2h(stage_1d_f32, symbol_stage_time, 0, 0, P, P, stage_f32, streaming=False,
+                        order=MemcpyOrder.ROW_MAJOR, data_type=MemcpyDataType.MEMCPY_32BIT, nonblock=False)
+
     time_start = np.zeros((P, P)).astype(int)
     time_end = np.zeros((P, P)).astype(int)
     word = np.zeros(3).astype(np.uint16)
@@ -310,6 +328,32 @@ def main():
     freq_ghz = 1.1
     time = (max_time_end - min_time_start) / total_repeat_times / (freq_ghz*1e6)
     print(f"Time: {time} ms")
+
+    # Per-stage cycle breakdown (single warmed pass, per PE)
+    u32 = stage_1d_f32.view(np.uint32).reshape(P, P, stage_f32)
+    words = np.empty((P, P, stage_f32 * 2), dtype=np.uint16)
+    words[..., 0::2] = (u32 & 0xFFFF).astype(np.uint16)
+    words[..., 1::2] = (u32 >> 16).astype(np.uint16)
+
+    w3 = words.reshape(P, P, n_bounds, 3).astype(np.int64)
+    stage_ts = w3[..., 0] + (w3[..., 1] << 16) + (w3[..., 2] << 32)
+
+    # Intra-PE deltas: launch skew cancels, so time_ref must NOT be subtracted.
+    stage_cycles = np.diff(stage_ts, axis=-1)
+
+    py, px = P // 2, P // 2
+    pe_cycles = stage_cycles[py, px]
+    pe_total = int(pe_cycles.sum())
+
+    print(f"\nPer-stage cycles (PE {px},{py}, final pass)")
+    print(f"{'stage':<16}{'cycles':>12}{'%':>8}{'grid min':>12}{'grid max':>12}")
+    for i, name in enumerate(stages):
+        c = int(pe_cycles[i])
+        pct = 100.0 * c / pe_total if pe_total else 0.0
+        print(f"{name:<16}{c:>12}{pct:>7.1f}%"
+              f"{int(stage_cycles[..., i].min()):>12}{int(stage_cycles[..., i].max()):>12}")
+    print(f"{'TOTAL':<16}{pe_total:>12}")
+
     
 if __name__ == "__main__":
     main()
