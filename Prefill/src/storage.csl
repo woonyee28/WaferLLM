@@ -1,0 +1,181 @@
+// Storage PE, holds the code catalog that will be streamed to the 
+// compute PE.
+
+param memcpy_params;
+param code_color: color;
+
+param dim_p_pe: i16;
+param seq_len_p_pe: i16;
+
+const _dim_p_pe: i16 = (dim_p_pe / 2) * 2;
+const seq_len_p_pe_2: i16 = seq_len_p_pe * 2;
+const dummy = @zeros([1]f16);
+
+// memcpy_params is required to know this PE's position in the rectangle
+const sys_mod = @import_module("<memcpy/memcpy>", memcpy_params);
+
+const max_fn_words: u16 = 256;
+const oq_code: output_queue = @get_output_queue(2);
+const send_fab_dsd = @get_dsd(fabout_dsd, .{
+    .extent       = max_fn_words,
+    .output_queue = oq_code,
+});
+
+var send_buf: [max_fn_words]u32 = @zeros([max_fn_words]u32);
+var send_src_dsd = @get_dsd(mem1d_dsd, .{
+    .tensor_access = |i|{max_fn_words} -> send_buf[i],
+});
+
+var dummy_f16: [1]f16 = @zeros([1]f16);
+var dummy_f32: [1]f32 = @zeros([1]f32);
+
+
+// Code catalog.
+
+var cos_val: f16 linksection(".rope_cos_val") = 0.0;
+var sin_val: f16 linksection(".rope_sin_val") = 0.0;
+
+// Scalars, so &cos_val is *f16 not [*]f16, and @ptrcast is runtime-only.
+// The cast happens in init_task; taking the address there is what makes
+// cos_val/sin_val escape and survive dead-code elimination.
+var ptr_cos_val: [*]f16 = &dummy_f16;
+var ptr_sin_val: [*]f16 = &dummy_f16;
+
+var freqs_sin: [_dim_p_pe / 2]f16 linksection(".rope_freqs_sin") = @zeros([_dim_p_pe / 2]f16);
+var freqs_cos: [_dim_p_pe / 2]f16 linksection(".rope_freqs_cos") = @zeros([_dim_p_pe / 2]f16);
+
+var ptr_rope_src: [*]f16 linksection(".rope_ptr_src") = &dummy_f16;
+
+var X_tmp_1: [_dim_p_pe / 2]f16 linksection(".rope_tmp_1") = @zeros([_dim_p_pe / 2]f16);
+var ptr_X_tmp_1: [*]f16 = &X_tmp_1;
+var X_tmp_1_dsd linksection(".rope_tmp_1_dsd") = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{_dim_p_pe / 2} -> X_tmp_1[i] });
+
+var X_tmp_2: [_dim_p_pe / 2]f16 linksection(".rope_tmp_2") = @zeros([_dim_p_pe / 2]f16);
+var ptr_X_tmp_2: [*]f16 = &X_tmp_2;
+var X_tmp_2_dsd linksection(".rope_tmp_2_dsd") = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{_dim_p_pe / 2} -> X_tmp_2[i] });
+
+var X_tmp_3: [_dim_p_pe / 2]f16 linksection(".rope_tmp_3") = @zeros([_dim_p_pe / 2]f16);
+var ptr_X_tmp_3: [*]f16 = &X_tmp_3;
+var X_tmp_3_dsd linksection(".rope_tmp_3_dsd") = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{_dim_p_pe / 2} -> X_tmp_3[i] });
+
+var X_tmp_4: [_dim_p_pe / 2]f16 linksection(".rope_tmp_4") = @zeros([_dim_p_pe / 2]f16);
+var ptr_X_tmp_4: [*]f16 = &X_tmp_4;
+var X_tmp_4_dsd linksection(".rope_tmp_4_dsd") = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{_dim_p_pe / 2} -> X_tmp_4[i] });
+
+var seqLen_dsd_1 linksection(".rope_dsd_1") = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{seq_len_p_pe} -> dummy[i] });
+var seqLen_dsd_2 linksection(".rope_dsd_2") = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{seq_len_p_pe} -> dummy[i] });
+
+// Verbatim copy of prefill.csl's rope_body. Any divergence changes the emitted
+// bytes and breaks the transplant.
+noinline fn rope_body() linksection(".cand_rope") void {
+    seqLen_dsd_1 = @set_dsd_base_addr(seqLen_dsd_1, ptr_rope_src);
+
+    seqLen_dsd_2 = @set_dsd_base_addr(seqLen_dsd_2, ptr_rope_src);
+    seqLen_dsd_2 = @increment_dsd_offset(seqLen_dsd_2, seq_len_p_pe, f16);
+
+    for (@range(i16, _dim_p_pe/2)) |i| {
+        cos_val = freqs_cos[i];
+        sin_val = freqs_sin[i];
+
+        if (i != 0) {
+            seqLen_dsd_1 = @increment_dsd_offset(seqLen_dsd_1, seq_len_p_pe_2, f16);
+            seqLen_dsd_2 = @increment_dsd_offset(seqLen_dsd_2, seq_len_p_pe_2, f16);
+        }
+
+        @fmulh(X_tmp_1_dsd, seqLen_dsd_2, cos_val);
+        @fmulh(X_tmp_2_dsd, seqLen_dsd_1, sin_val);
+        @fmulh(X_tmp_3_dsd, seqLen_dsd_1, cos_val);
+        @fmulh(X_tmp_4_dsd, seqLen_dsd_2, sin_val);
+
+        @fsubh(seqLen_dsd_1, X_tmp_1_dsd, X_tmp_2_dsd);
+        @faddh(seqLen_dsd_2, X_tmp_3_dsd, X_tmp_4_dsd);
+    }
+}
+
+var ptr_X: [*]f16 = &dummy_f16;
+var ptr_W: [*]f16 = &dummy_f16;
+var ptr_Q_weight: [*]f16 = &dummy_f16;
+var ptr_K_weight: [*]f16 = &dummy_f16;
+var ptr_V_weight: [*]f16 = &dummy_f16;
+// Aimed at the real arrays, not dummy_f16, so the host *could* write them.
+// If nothing can write freqs_*, this compiler proves they are all-zero and
+// constant-folds `freqs_cos[i]` (and cos_val/sin_val with it) out of rope_body,
+// emitting different bytes than the compute PE does.
+var ptr_freqs_sin: [*]f16 = &freqs_sin;
+var ptr_freqs_cos: [*]f16 = &freqs_cos;
+var ptr_O_weight: [*]f16 = &dummy_f16;
+var ptr_UP_weight: [*]f16 = &dummy_f16;
+var ptr_GATE_weight: [*]f16 = &dummy_f16;
+var ptr_DOWN_weight: [*]f16 = &dummy_f16;
+
+var ptr_time_memcpy: [*]f32 = &dummy_f32;
+var ptr_time_ref: [*]f32 = &dummy_f32;
+var ptr_stage_time: [*]f32 = &dummy_f32;
+
+var unused_warmup_times: i16 = 0;
+var unused_repeat_times: i16 = 0;
+
+fn init_task() void {
+    // Retarget the send DSD at rope_body's own instruction words and ship them.
+    // @ptrcast is what lets us read code as data; it is runtime-only.
+    //
+    // This reference is also what keeps rope_body (and every global it names)
+    // alive on this PE: nothing here calls rope_body, so without it dead-code
+    // elimination drops the whole catalog and the pinned sections vanish.
+    ptr_cos_val = @ptrcast([*]f16, &cos_val);
+    ptr_sin_val = @ptrcast([*]f16, &sin_val);
+    send_src_dsd = @set_dsd_base_addr(send_src_dsd, @ptrcast([*]u32, &rope_body));
+    @mov32(send_fab_dsd, send_src_dsd);
+    sys_mod.unblock_cmd_stream();
+}
+
+fn prefill_host(total_warmup_times_: i16, total_repeat_times_: i16) void {
+    unused_warmup_times = total_warmup_times_;
+    unused_repeat_times = total_repeat_times_;
+
+    // Second, different assignment to ptr_rope_src. On the compute PE the
+    // dispatcher writes it two ways (ptr_XQ / ptr_XK), so it must live in memory
+    // and be loaded. With only one possible value here, this compiler would fold
+    // the load into an immediate and rope_body's bytes would diverge. Never
+    // executed in a way that matters -- it exists to match the compute PE's
+    // information, not to do anything.
+    ptr_rope_src = @ptrcast([*]f16, &send_buf);
+
+    sys_mod.unblock_cmd_stream();
+}
+
+comptime {
+    // Each PE runs `wtt_launch`, a dispatcher the compiler generates from the @export_name 
+    // declaration in the layout block, and it maps that ID to a function. Since those 
+    // declaration are rectangle wide, every PE gets a table of the same shape, and ID 12 must mean init_task()
+    // on every PEs, so using the same export_symbols on layout.csl, storage.csl, and compute.csl 
+    // ensures that the same ID maps to the same function on every PE.
+    @export_symbol(ptr_X, "X");
+    @export_symbol(ptr_W, "W");
+    @export_symbol(ptr_Q_weight, "Q_weight");
+    @export_symbol(ptr_K_weight, "K_weight");
+    @export_symbol(ptr_V_weight, "V_weight");
+    @export_symbol(ptr_freqs_sin, "freqs_sin");
+    @export_symbol(ptr_freqs_cos, "freqs_cos");
+    @export_symbol(ptr_O_weight, "O_weight");
+    @export_symbol(ptr_UP_weight, "UP_weight");
+    @export_symbol(ptr_GATE_weight, "GATE_weight");
+    @export_symbol(ptr_DOWN_weight, "DOWN_weight");
+
+    @export_symbol(init_task);
+    @export_symbol(prefill_host);
+
+    @export_symbol(ptr_rope_src, "rope_src");
+    @export_symbol(ptr_cos_val, "rope_cos_val");
+    @export_symbol(ptr_sin_val, "rope_sin_val");
+    @export_symbol(ptr_X_tmp_1, "rope_tmp_1");
+    @export_symbol(ptr_X_tmp_2, "rope_tmp_2");
+    @export_symbol(ptr_X_tmp_3, "rope_tmp_3");
+    @export_symbol(ptr_X_tmp_4, "rope_tmp_4");
+
+    @export_symbol(ptr_time_memcpy, "time_memcpy");
+    @export_symbol(ptr_time_ref, "time_ref");
+    @export_symbol(ptr_stage_time, "stage_time");
+
+    @initialize_queue(oq_code, .{ .color = code_color });
+}

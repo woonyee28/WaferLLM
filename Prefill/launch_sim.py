@@ -1,5 +1,6 @@
 import numpy as np
 import argparse
+import glob
 import struct
 import os
 import json
@@ -7,6 +8,17 @@ import json
 from cerebras.sdk.sdk_utils import input_array_to_u32
 from cerebras.sdk.runtime.sdkruntimepybind import SdkRuntime
 from cerebras.sdk.runtime.sdkruntimepybind import MemcpyDataType, MemcpyOrder
+
+# stages dispatched by prefill_struct(), in `flag` order (0..15 plus the else tail).
+# 17 stages -> 18 boundary timestamps -> 17 deltas.
+stages = [
+    "rmsnorm_x", "xq_matmul", "xk_matmul", "xv_matmul", "xq_rope", "xk_rope",
+    "score_matmul", "softmax_score", "output_matmul", "h1_matmul", "z_add",
+    "rmsnorm_z", "z1_matmul", "z2_matmul", "z3_comp", "h2_matmul", "add_result",
+]
+
+n_bounds = 18
+stage_f32 = n_bounds * 3 // 2  # 3 u16 per timestamp, packed 2 u16 per f32
 
 def float_to_hex(f):
     return hex(struct.unpack("<I", struct.pack("<f", f))[0])
@@ -61,9 +73,122 @@ class Config:
         self.seq_len = 64
         self.ffn_dim = 64
         
+# Tiles worth capturing as a numerical baseline. XQ/XK are the rope outputs and
+# are the tightest check for a rope overlay; Z is the end-to-end result.
+BASELINE_TILES = ("X_tile", "X_norm_tile", "XQ_tile", "XK_tile", "XV_tile",
+                  "output_tile", "h1_tile", "h2_tile", "Z_tile")
+
+# Symbols that are not (seq_len_p_pe x dim_p_pe) tiles: captured raw, per PE,
+# with no reassembly. Each entry is (csl_name, numpy dtype).
+FLAT_SYMBOLS = (("slot_buf", np.uint32),)
+
+# Matches --fabric-offsets=4,1 in compile.py: the P x P core rectangle starts here.
+CORE_OFFSET = (4, 1)
+
+# Baselines live outside out_<cfg>, which compile.py deletes on every build.
+BASELINE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "baseline")
+
+
+def _resolve_symbols(bin_dir, wanted):
+    """Map CSL names to their ELF names.
+
+    The compiler renames module-level arrays to '$$csl_base_address$$<n>$$<name>',
+    and debug_util looks symbols up literally, so the plain name never resolves.
+    """
+    from cerebras.elf.cself import ELFLoader
+    resolved = {}
+    for elf in sorted(glob.glob(os.path.join(bin_dir, "out_*.elf"))):
+        try:
+            syms = ELFLoader(elf_file=elf).symbols
+        except Exception:
+            continue
+        names = list(syms.keys()) if hasattr(syms, "keys") else list(syms)
+        for w in wanted:
+            if w in resolved:
+                continue
+            for n in names:
+                if n == w or n.endswith("$$" + w):
+                    resolved[w] = n
+                    break
+        if len(resolved) == len(wanted):
+            break
+    return resolved
+
+
+def dump_tiles(P, seq_len_p_pe, dim_p_pe, tag):
+    """Save the on-PE tiles as numpy, for use as an overlay verification baseline.
+
+    Must run in-process after runner.stop(): debug_util reads the live simulator's
+    memory, so a separate post-hoc process has nothing to read. Nothing here is
+    exported from prefill.csl, so the binary is unaffected by this capture.
+
+    A tile is stored transposed on the PE, so both the raw (P, P, N) tiles and the
+    reassembled (seq_len, dim) matrices are saved. Prefer the raw tiles when
+    comparing runs: they carry no layout assumption.
+    """
+    from cerebras.sdk.debug.debug_util import debug_util
+
+    out_dir = os.getcwd()
+    resolved = _resolve_symbols(os.path.join(out_dir, "bin"), BASELINE_TILES)
+    debug = debug_util(out_dir)
+
+    raw, assembled = {}, {}
+    for sym in BASELINE_TILES:
+        elf_name = resolved.get(sym)
+        if elf_name is None:
+            print(f"  {sym:<14} SKIP (no such symbol; inlined away?)")
+            continue
+        tiles = np.asarray(debug.get_symbol_rect(
+            (CORE_OFFSET, (P, P)), elf_name, np.float16))
+        raw[sym] = tiles
+
+        mat = np.zeros((P * seq_len_p_pe, P * dim_p_pe), dtype=np.float16)
+        for x in range(P):
+            for y in range(P):
+                mat[y * seq_len_p_pe:(y + 1) * seq_len_p_pe,
+                    x * dim_p_pe:(x + 1) * dim_p_pe] = \
+                    tiles[x, y].reshape(dim_p_pe, seq_len_p_pe).T
+        assembled[sym] = mat
+        print(f"  {sym:<14} {tiles.shape} -> {mat.shape}  "
+              f"min={np.nanmin(mat):.4g} max={np.nanmax(mat):.4g}")
+
+    flat_resolved = _resolve_symbols(os.path.join(out_dir, "bin"),
+                                     [s for s, _ in FLAT_SYMBOLS])
+    for sym, dtype in FLAT_SYMBOLS:
+        elf_name = flat_resolved.get(sym)
+        if elf_name is None:
+            continue
+        vals = np.asarray(debug.get_symbol_rect(
+            (CORE_OFFSET, (P, P)), elf_name, dtype))
+        raw[sym] = vals
+        print(f"  {sym:<14} {vals.shape} {vals.dtype}  "
+              f"first PE head={[hex(int(v)) for v in vals[0, 0][:3]]}")
+
+    raw_path = os.path.join(BASELINE_DIR, f"{tag}_tiles_raw.npz")
+    mat_path = os.path.join(BASELINE_DIR, f"{tag}_tiles.npz")
+    np.savez(raw_path, **raw)
+    np.savez(mat_path, **assembled)
+    print(f"  wrote {raw_path}\n  wrote {mat_path}")
+
+    # X_tile is never written by the pass, so it must still equal the host input.
+    # That round-trip is what validates the reassembly above.
+    if "X_tile" in assembled:
+        ref = np.load(os.path.join(BASELINE_DIR, f"{tag}_inputs.npz"))["X"]
+        ok = np.array_equal(assembled["X_tile"], ref)
+        print(f"  layout round-trip on X_tile: {'PASS' if ok else 'FAIL'}")
+
+
 def parse_args():
     parser = argparse.ArgumentParser(description="Prefill on simulator")
     parser.add_argument("--config", default="config.json", type=str, help="Config file")
+    parser.add_argument("--scale", default=1.0, type=float,
+                        help="Scale factor on the random weights. The default 1.0 "
+                             "overflows fp16 by the end of the FFN, leaving Z_tile "
+                             "all-inf; use a smaller value for a usable end-to-end "
+                             "numerical baseline.")
+    parser.add_argument("--seed", default=0, type=int,
+                        help="RNG seed for the random inputs, so a run is reproducible "
+                             "and can serve as a numerical baseline")
     args = parser.parse_args()
     return args
 
@@ -93,24 +218,27 @@ def main():
     io_dtype = MemcpyDataType.MEMCPY_16BIT
     memcpy_order = MemcpyOrder.ROW_MAJOR
     
+    np.random.seed(args.seed)
+    s = args.scale
+
     tensor_X = np.random.rand(seq_len, dim).astype(np.float16)
-    
+
     W = np.random.rand(1, dim).astype(np.float16)
     tensor_W = np.tile(W.reshape(P, dim_p_pe), reps=(1, P))
-    
-    tensor_q_weight = np.random.rand(dim, dim).astype(np.float16)
-    tensor_k_weight = np.random.rand(dim, dim).astype(np.float16)
-    tensor_v_weight = np.random.rand(dim, dim).astype(np.float16)
+
+    tensor_q_weight = (s * np.random.rand(dim, dim)).astype(np.float16)
+    tensor_k_weight = (s * np.random.rand(dim, dim)).astype(np.float16)
+    tensor_v_weight = (s * np.random.rand(dim, dim)).astype(np.float16)
 
     freqs_sin = np.random.rand(1, P*_dim_p_pe//2).astype(np.float16)
     tensor_freqs_sin = np.tile(freqs_sin.reshape(P, _dim_p_pe//2), reps=(1, P))
     freqs_cos = np.random.rand(1, P*_dim_p_pe//2).astype(np.float16)
     tensor_freqs_cos = np.tile(freqs_cos.reshape(P, _dim_p_pe//2), reps=(1, P))
 
-    tensor_o_weight = np.random.rand(dim, dim).astype(np.float16)
-    tensor_up_weight = np.random.rand(dim, ffn_dim).astype(np.float16)
-    tensor_gate_weight = np.random.rand(dim, ffn_dim).astype(np.float16)
-    tensor_down_weight = np.random.rand(ffn_dim, dim).astype(np.float16)
+    tensor_o_weight = (s * np.random.rand(dim, dim)).astype(np.float16)
+    tensor_up_weight = (s * np.random.rand(dim, ffn_dim)).astype(np.float16)
+    tensor_gate_weight = (s * np.random.rand(dim, ffn_dim)).astype(np.float16)
+    tensor_down_weight = (s * np.random.rand(ffn_dim, dim)).astype(np.float16)
     
     ind = np.zeros((P, P)).astype(int)
     
@@ -157,6 +285,20 @@ def main():
     if not os.path.isdir(out_dir):
         raise SystemExit(f"Host: {out_dir} not found — run compile.py --mode sim first")
     os.chdir(out_dir)
+
+    # Persist the exact inputs so any later run (overlay or not) can be checked
+    # against this one without re-deriving them.
+    tag = f"{cfg_name}_seed{args.seed}_scale{args.scale:g}"
+    os.makedirs(BASELINE_DIR, exist_ok=True)
+    np.savez(os.path.join(BASELINE_DIR, f"{tag}_inputs.npz"),
+             seed=np.int64(args.seed), scale=np.float64(args.scale),
+             X=tensor_X, W=tensor_W,
+             q_weight=tensor_q_weight, k_weight=tensor_k_weight,
+             v_weight=tensor_v_weight, o_weight=tensor_o_weight,
+             up_weight=tensor_up_weight, gate_weight=tensor_gate_weight,
+             down_weight=tensor_down_weight,
+             freqs_sin=tensor_freqs_sin, freqs_cos=tensor_freqs_cos)
+
     runner = SdkRuntime(out_dir)
     runner.load()
     runner.run()
@@ -175,6 +317,7 @@ def main():
     
     symbol_time_memcpy = runner.get_id("time_memcpy")
     symbol_time_ref = runner.get_id("time_ref")
+    symbol_stage_time = runner.get_id("stage_time")
     
     Xc1 = tensor_X.reshape(P, seq_len_p_pe, P, dim_p_pe)
     Xc2 = Xc1.transpose(0, 2, 3, 1)
@@ -267,9 +410,17 @@ def main():
     runner.memcpy_d2h(time_ref_1d_f32, symbol_time_ref, 0, 0, P, P, 2, streaming=False,
                     order=MemcpyOrder.ROW_MAJOR, data_type=MemcpyDataType.MEMCPY_32BIT, nonblock=False)
     time_ref_hwl = np.reshape(time_ref_1d_f32, (P, P, 2), order='C')
-    
+
+    # Per-stage boundary timestamps. stage_tsc is overwritten every pass, so
+    # what survives is the final (fully warmed) pass.
+    stage_1d_f32 = np.zeros(P*P*stage_f32, dtype=np.float32)
+    runner.memcpy_d2h(stage_1d_f32, symbol_stage_time, 0, 0, P, P, stage_f32, streaming=False,
+                    order=MemcpyOrder.ROW_MAJOR, data_type=MemcpyDataType.MEMCPY_32BIT, nonblock=False)
+
     runner.stop()
-    
+
+    dump_tiles(P, seq_len_p_pe, dim_p_pe, tag)
+
     time_start = np.zeros((P, P)).astype(int)
     time_end = np.zeros((P, P)).astype(int)
     word = np.zeros(3).astype(np.uint16)
@@ -311,6 +462,31 @@ def main():
     print(f"\nRepeat count: {total_repeat_times}")
     print(f"Mean cycle count: {np.mean(time_end - time_start)/total_repeat_times}")
     print(f"Max Cycle count: {(max_time_end - min_time_start)/total_repeat_times}")
-    
+
+    # Per-stage cycle breakdown (single warmed pass, per PE)
+    u32 = stage_1d_f32.view(np.uint32).reshape(P, P, stage_f32)
+    words = np.empty((P, P, stage_f32 * 2), dtype=np.uint16)
+    words[..., 0::2] = (u32 & 0xFFFF).astype(np.uint16)
+    words[..., 1::2] = (u32 >> 16).astype(np.uint16)
+
+    w3 = words.reshape(P, P, n_bounds, 3).astype(np.int64)
+    stage_ts = w3[..., 0] + (w3[..., 1] << 16) + (w3[..., 2] << 32)
+
+    # Intra-PE deltas: launch skew cancels, so time_ref must NOT be subtracted.
+    stage_cycles = np.diff(stage_ts, axis=-1)
+
+    py, px = P // 2, P // 2
+    pe_cycles = stage_cycles[py, px]
+    pe_total = int(pe_cycles.sum())
+
+    print(f"\nPer-stage cycles (PE {px},{py}, final pass)")
+    print(f"{'stage':<16}{'cycles':>12}{'%':>8}{'grid min':>12}{'grid max':>12}")
+    for i, name in enumerate(stages):
+        c = int(pe_cycles[i])
+        pct = 100.0 * c / pe_total if pe_total else 0.0
+        print(f"{name:<16}{c:>12}{pct:>7.1f}%"
+              f"{int(stage_cycles[..., i].min()):>12}{int(stage_cycles[..., i].max()):>12}")
+    print(f"{'TOTAL':<16}{pe_total:>12}")
+
 if __name__ == "__main__":
     main()

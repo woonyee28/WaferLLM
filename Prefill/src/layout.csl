@@ -30,9 +30,10 @@ const X_2: color = @get_color(8);
 const Y_0: color = @get_color(9);
 const Y_1: color = @get_color(10);
 const Y_2: color = @get_color(11);
+const C_overlay: color = @get_color(12);
 
 const memcpy = @import_module( "<memcpy/get_params>", .{
-    .width = P,
+    .width = P+1,
     .height = P,
 });
 
@@ -47,7 +48,7 @@ const comm = @import_module("comm_lib/comm_layout.csl", .{
 const math = @import_module("<math>");
 
 layout {
-    @set_rectangle(P, P);
+    @set_rectangle(P+1, P);
 
     var px: i16 = 0;
     var py: i16 = 0;
@@ -82,6 +83,7 @@ layout {
                     .bd_color = C_BD,
                 },
                 .P = P, .dim_p_pe = dim_p_pe, .seq_len_p_pe = seq_len_p_pe, .ffn_dim_p_pe = ffn_dim_p_pe,
+                .code_color = C_overlay,
             });
 
             {
@@ -178,6 +180,7 @@ layout {
                     .bd_color = C_BD,
                 },
                 .P = P, .dim_p_pe = dim_p_pe, .seq_len_p_pe = seq_len_p_pe, .ffn_dim_p_pe = ffn_dim_p_pe,
+                .code_color = C_overlay,
             });
 
             {
@@ -247,6 +250,30 @@ layout {
         }
     }
 
+    const storage_memcpy_params = memcpy.get_params(P); // takes column index and returns that column's memcpy routing config
+    py = 0;
+    while (py < P) : (py += 1) {
+        @set_tile_code(P, py, "storage.csl", .{
+            .memcpy_params = storage_memcpy_params,
+            .code_color = C_overlay,
+            .dim_p_pe = dim_p_pe, .seq_len_p_pe = seq_len_p_pe,
+        });
+    }
+
+    px = 0;
+    while (px < P+1) : (px += 1) {
+        py = 0;
+        while (py < P) : (py += 1) {
+            if (px==P){
+                @set_color_config(px, py, C_overlay, .{ .routes = .{ .rx = .{RAMP}, .tx = .{WEST} } });
+            } else if (px==0){
+                @set_color_config(px, py, C_overlay, .{ .routes = .{ .rx = .{EAST}, .tx = .{RAMP} } });
+            } else {
+                @set_color_config(px, py, C_overlay, .{ .routes = .{ .rx = .{EAST}, .tx = .{RAMP, WEST} } });
+            }
+        }
+    }
+
     @export_name("X", [*]f16, true);
     @export_name("W", [*]f16, true);
     @export_name("Q_weight", [*]f16, true);
@@ -261,6 +288,17 @@ layout {
 
     @export_name("init_task", fn()void);
     @export_name("prefill_host", fn(i16, i16)void);
+
+    // Anti-DCE anchors. Once rope_body lives only on the storage PE, nothing in
+    // prefill.csl references these, so the compiler would drop them and their
+    // pinned sections -- while the streamed code still writes those addresses.
+    @export_name("rope_src", [*]f16, true);
+    @export_name("rope_cos_val", [*]f16, true);
+    @export_name("rope_sin_val", [*]f16, true);
+    @export_name("rope_tmp_1", [*]f16, true);
+    @export_name("rope_tmp_2", [*]f16, true);
+    @export_name("rope_tmp_3", [*]f16, true);
+    @export_name("rope_tmp_4", [*]f16, true);
 
     @export_name("time_memcpy", [*]f32, true);
     @export_name("time_ref", [*]f32, true);
