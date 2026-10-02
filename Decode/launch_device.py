@@ -8,6 +8,31 @@ from cerebras.sdk.client import SdkRuntime, sdk_utils
 
 out_path = "compile_out"
 
+# Labels for the per-stage breakdown, identical to MeshJIT decode-jit's so the
+# two decodes print comparable tables. Segment i is the wall-clock from stamp i
+# to stamp i+1; the order must match the stamps in decode_struct.
+STAGE_LABELS = [
+    "struct->rms1", "rms1", "rms2 +QKV mv", "QKV all-reduce",
+    "gb rope+score mv", "score all-reduce", "gc sm1", "max-reduce", "sm2",
+    "sum-reduce", "sm3 +out+h1", "ga2 ares", "rms1 ffn", "rms2 +UP/GATE mv",
+    "UP/GATE all-reduce", "gd silu", "z3 +DOWN mv", "DOWN all-reduce",
+]
+
+
+def print_stage_breakdown(stage_hwl):
+    """stage_hwl: (P,P,N_STAGE) u32 boundary timestamps (low 32 bits of the TSC).
+    Print per-stage cycles (consecutive deltas, mod 2^32) as grid mean and max."""
+    n = len(STAGE_LABELS)
+    v = stage_hwl.astype(np.int64)
+    seg = (v[:, :, 1:n + 1] - v[:, :, 0:n]) & 0xFFFFFFFF
+    print("per-stage cycles (last timed pass):")
+    print(f"  {'stage':22}{'mean':>10}{'max':>10}")
+    for i, lab in enumerate(STAGE_LABELS):
+        s = seg[:, :, i]
+        print(f"  {lab:22}{s.mean():10.0f}{s.max():10.0f}")
+    tot = seg.sum(axis=2)
+    print(f"  {'captured sum':22}{tot.mean():10.0f}{tot.max():10.0f}")
+
 def cast_tensor_u32(tensor):
     return np.uint32(tensor.view(np.uint16))
 
@@ -261,7 +286,19 @@ def main():
             data_type=MemcpyDataType.MEMCPY_32BIT, order=MemcpyOrder.ROW_MAJOR, nonblock=False
         )
         timer_buf_time_hwl = timer_buf_1d_u32.view(np.float32).reshape((P, P, 3))
-        
+
+        # Per-stage breakdown, present only on instrumented builds.
+        stage_hwl = None
+        try:
+            sym_stage = runner.get_id("stage_time")
+            n_stage = len(STAGE_LABELS) + 1   # boundary stamps = segments + 1
+            stage_1d = np.zeros((P * P * n_stage), dtype=np.uint32)
+            runner.memcpy_d2h(stage_1d, sym_stage, 0, 0, P, P, n_stage, streaming=False,
+                              data_type=MemcpyDataType.MEMCPY_32BIT, order=MemcpyOrder.ROW_MAJOR, nonblock=False)
+            stage_hwl = stage_1d.reshape((P, P, n_stage))
+        except Exception as e:
+            print(f"Host: no stage_time symbol, skipping per-stage breakdown ({e})")
+
     # -------------------------------------------------------------------------- #
     # ------------------------------ Compute time ------------------------------ #
     # -------------------------------------------------------------------------- #
@@ -279,6 +316,9 @@ def main():
 
     throughput_p_request = 1 / ((cycles_count_mean_per_step*layer_num) / (freq_ghz*1e9))
     print(f"Throughput_p_request: {throughput_p_request}")
-    
+
+    if stage_hwl is not None:
+        print_stage_breakdown(stage_hwl)
+
 if __name__ == "__main__":
     main()

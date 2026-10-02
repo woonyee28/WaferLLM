@@ -100,4 +100,5 @@ layout {
 
     @export_name("timer_buf", [*]f32, true);
     @export_name("time_ref", [*]f32, true);
+    @export_name("stage_time", [*]f32, true);
 }

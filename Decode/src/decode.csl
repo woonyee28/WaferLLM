@@ -83,6 +83,20 @@ var tsc_ref_buf = @zeros([timestamp.tsc_size_words]u16);
 var time_ref_f32 = @zeros([2]f32);
 var ptr_time_ref: [*]f32 = &time_ref_f32;
 
+// Per-stage cycle breakdown, mirroring MeshJIT decode-jit's streamed decode so
+// the two print comparable tables. A counter reset at decode_struct and bumped
+// by each stamp records the last timed pass's boundary timestamps; the host
+// diffs consecutive ones into per-stage segments. Each stamp sits at the point
+// where the streamed decode starts the same stage, including the four
+// reduce-boundary stamps that split the big matvecs from their all-reduce.
+const TSW: i16 = @as(i16, timestamp.tsc_size_words);
+const N_STAGE: i16 = 24;
+var stage_tsc = @zeros([N_STAGE * timestamp.tsc_size_words]u16);
+var stage_scratch = @zeros([timestamp.tsc_size_words]u16);
+var stage_time_f32 = @zeros([N_STAGE]f32);
+var ptr_stage_time: [*]f32 = &stage_time_f32;
+var stage_i: i16 = 0;
+
 // -------------------------------------------------------------------------- //
 // --------------------------------- Utils ---------------------------------- //
 // -------------------------------------------------------------------------- //
@@ -361,6 +375,7 @@ fn rmsnorm_x() void {
 
     comm_mod.all_reduce_bsz(py, quotient_y, remainder_y, ptr_local_sum);
 
+    stage_stamp();              // rms2
     dim_p_pe_dsd_1 = @set_dsd_base_addr(dim_p_pe_dsd_1, ptr_X_norm);
     dim_p_pe_dsd_2 = @set_dsd_base_addr(dim_p_pe_dsd_2, ptr_X_tmp);
     @load_to_dsr(dest_dsr_1, dim_p_pe_dsd_1, .{ .save_address = true});
@@ -521,8 +536,11 @@ fn score_matvec_mult() void {
 
     vecmat_computation();
 
+    stage_stamp();              // reduce boundary: matvec compute above, all-reduce below
     comm_mod.all_reduce_bsz_seq_len(px, quotient_x, remainder_x, ptr_score);
 
+    // The streamed decode does the score scaling at the head of its sm1 stage.
+    stage_stamp();              // gc sm1
     // score factor
     @load_to_dsr(dest_dsr_1, score_dsd);
     @load_to_dsr(src0_dsr_1, score_dsd);
@@ -539,8 +557,10 @@ fn softmax_score() void {
         local_max[b] = max;
     }
 
+    stage_stamp();              // max-reduce
     comm_mod.all_reduceMax_bsz(py, quotient_y, remainder_y, ptr_local_max);
 
+    stage_stamp();              // sm2
     seq_len_p_pe_dsd_1 = @set_dsd_base_addr(seq_len_p_pe_dsd_1, ptr_score_tmp);
     seq_len_p_pe_dsd_2 = @set_dsd_base_addr(seq_len_p_pe_dsd_2, ptr_score);
     @load_to_dsr(dest_dsr_1, seq_len_p_pe_dsd_1, .{ .save_address = true });
@@ -557,8 +577,10 @@ fn softmax_score() void {
         local_sum[b] = sum;
     }
 
+    stage_stamp();              // sum-reduce
     comm_mod.all_reduce_bsz(py, quotient_y, remainder_y, ptr_local_sum);
 
+    stage_stamp();              // sm3
     seq_len_p_pe_dsd_1 = @set_dsd_base_addr(seq_len_p_pe_dsd_1, ptr_score);
     @load_to_dsr(dest_dsr_1, seq_len_p_pe_dsd_1, .{ .save_address = true });
     @load_to_dsr(src0_dsr_1, seq_len_p_pe_dsd_1, .{ .save_address = true });
@@ -622,6 +644,7 @@ fn rmsnorm_z() void {
 
     comm_mod.all_reduce_bsz(py, quotient_y, remainder_y, ptr_local_sum);
 
+    stage_stamp();              // rms2 ffn
     dim_p_pe_dsd_1 = @set_dsd_base_addr(dim_p_pe_dsd_1, ptr_z_norm);
     dim_p_pe_dsd_2 = @set_dsd_base_addr(dim_p_pe_dsd_2, ptr_X_tmp);
     @load_to_dsr(dest_dsr_1, dim_p_pe_dsd_1, .{ .save_address = true });
@@ -700,6 +723,7 @@ fn down_matvec_mult() void {
 
     vecmat_computation();
 
+    stage_stamp();              // reduce boundary: matvec compute above, all-reduce below
     comm_mod.all_reduce_bsz_dim(px, quotient_x, remainder_x, ptr_h2);
 }
 
@@ -711,16 +735,22 @@ fn ffn_residual_add() void {
 }
 
 fn decode_struct() void {
+    stage_i = 0;
+    stage_stamp();              // 0: pass start
 
+    // The streamed decode waits here for its rms1 page; this has no wait.
+    stage_stamp();              // rms1
     rmsnorm_x();
 
     xq_matvec_mult();
     xk_matvec_mult();
     xv_matvec_mult();
+    stage_stamp();              // reduce boundary: matvec compute above, all-reduce below
     comm_mod.all_reduce_bsz_dim_QKV_fusion(py, quotient_y, remainder_y, ptr_QKV_tile);
 
     comm_mod.reconfig_allreduce_axis(0); // 0: px row-wise, 1: py col-wise
 
+    stage_stamp();              // gb rope+score mv
     xq_rope();
     xk_rope();
 
@@ -736,24 +766,31 @@ fn decode_struct() void {
 
     o_matvec_mult();
 
+    stage_stamp();              // ga2 ares
     attn_residual_add();
 
     comm_mod.reconfig_allreduce_axis(1);
 
+    stage_stamp();              // rms1 ffn
     rmsnorm_z();
 
     up_matvec_mult();
     gate_matvec_mult();
+    stage_stamp();              // reduce boundary: matvec compute above, all-reduce below
     comm_mod.all_reduce_bsz_ffn_dim_ZZ_fusion(py, quotient_y, remainder_y, ptr_ZZ_tile);
 
+    stage_stamp();              // gd silu
     z2_silu();
 
+    stage_stamp();              // z3 +DOWN mv
     z3_mat();
 
     comm_mod.reconfig_allreduce_axis(0);
 
     down_matvec_mult();
 
+    // End of the last segment, where the streamed decode's ga_tail starts.
+    stage_stamp();
     ffn_residual_add();
 
     comm_mod.reconfig_allreduce_axis(1);
@@ -767,6 +804,7 @@ fn exit() void {
 
     f_reference_timestamps();
     f_memcpy_timestamps();
+    f_stage_timestamps();
     sys_mod.unblock_cmd_stream();
 }
 
@@ -805,6 +843,27 @@ fn decode_entry() void {
 // -------------------------------------------------------------------------- //
 // ------------------------------- Timer Funcs ------------------------------ //
 // -------------------------------------------------------------------------- //
+
+// One stamp into the next slot. noinline so get_timestamp is emitted once.
+noinline fn stage_stamp() void {
+    timestamp.get_timestamp(&stage_scratch);
+    if (stage_i < N_STAGE) {
+        var k: i16 = 0;
+        while (k < TSW) : (k += 1) {
+            stage_tsc[stage_i * TSW + k] = stage_scratch[k];
+        }
+        stage_i += 1;
+    }
+}
+
+noinline fn f_stage_timestamps() void {
+    var i: i16 = 0;
+    while (i < N_STAGE) : (i += 1) {
+        var lo_: u16 = stage_tsc[i * TSW + 0];
+        var hi_: u16 = stage_tsc[i * TSW + 1];
+        stage_time_f32[i] = @bitcast(f32, (@as(u32, hi_) << @as(u16, 16)) | @as(u32, lo_));
+    }
+}
 
 fn f_memcpy_timestamps() void {
     var lo_ : u16 = 0;
@@ -865,4 +924,5 @@ comptime {
 comptime {
     @export_symbol(ptr_timer_buf, "timer_buf");
     @export_symbol(ptr_time_ref, "time_ref");
+    @export_symbol(ptr_stage_time, "stage_time");
 }
