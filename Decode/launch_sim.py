@@ -20,9 +20,19 @@ class Config:
         self.seq_len = 64
         self.ffn_dim = 64
 
+def rand_w(rows, cols, fan_in):
+    # Zero-mean and 1/sqrt(fan_in) so the f16 chain stays in range. Raw U(0,1)
+    # weights drive |h2| to ~57k against an f16 ceiling of 65504, where the ULP
+    # is 32 and the output carries ~11 bits.
+    return ((np.random.rand(rows, cols) * 2.0 - 1.0) / np.sqrt(fan_in)).astype(np.float16)
+
 def parse_args():
     parser = argparse.ArgumentParser(description="Move to right unit test")
     parser.add_argument("--config", default="config.json", type=str, help="Config file")
+    parser.add_argument("--seed", default=0, type=int, help="RNG seed for the random inputs")
+    parser.add_argument("--replicate-bsz1", action="store_true",
+                        help="draw the input exactly as a bsz=1 run would and copy it into "
+                             "every batch row, as decode-jit's batch runs do")
     args = parser.parse_args()
     return args
 
@@ -60,15 +70,28 @@ def main():
     io_dtype = MemcpyDataType.MEMCPY_16BIT
     memcpy_order = MemcpyOrder.ROW_MAJOR
 
-    X = np.random.rand(1, bsz*dim).astype(np.float16)
+    # Same draws, order and scaling as MeshJIT decode-jit's launchers, so with the
+    # same --seed both decodes run on identical inputs. Cycle counts depend on the
+    # data (silu's f16 division takes value-dependent paths), so a comparison
+    # between the two is only fair on the same values.
+    np.random.seed(args.seed)
+
+    if args.replicate_bsz1:
+        # Consume the RNG exactly as bsz=1 does, so W and every weight matrix
+        # below come out identical to a bsz=1 run's, and copy that input into
+        # every batch row. The input is laid out [py][b][d].
+        X1 = (np.random.rand(1, dim) * 2.0 - 1.0).astype(np.float16)
+        X = np.repeat(X1.reshape(P, 1, dim_p_pe), bsz, axis=1).reshape(1, bsz*dim)
+    else:
+        X = (np.random.rand(1, bsz*dim) * 2.0 - 1.0).astype(np.float16)
     tensor_X = np.tile(X.reshape(P, bsz*dim_p_pe), reps=(1, P))
     
     W = np.random.rand(1, dim).astype(np.float16)
     tensor_W = np.tile(W.reshape(P, dim_p_pe), reps=(1, P))
     
-    tensor_q_weight = np.random.rand(dim, dim).astype(np.float16)
-    tensor_k_weight = np.random.rand(dim, dim).astype(np.float16)
-    tensor_v_weight = np.random.rand(dim, dim).astype(np.float16)
+    tensor_q_weight = rand_w(dim, dim, dim)
+    tensor_k_weight = rand_w(dim, dim, dim)
+    tensor_v_weight = rand_w(dim, dim, dim)
     
     _dim_p_pe = dim_p_pe
     if (dim_p_pe % 2) == 1:
@@ -79,13 +102,14 @@ def main():
     freqs_cos = np.random.rand(1, P*_dim_p_pe//2).astype(np.float16)
     tensor_freqs_cos = np.tile(freqs_cos.reshape(P, _dim_p_pe//2), reps=(1, P))
     
-    tensor_XKCache = np.random.rand(dim, seq_len).astype(np.float16)
-    tensor_XVCache = np.random.rand(seq_len, dim).astype(np.float16)
+    # score contracts XKCache over dim; output contracts XVCache over seq_len.
+    tensor_XKCache = rand_w(dim, seq_len, dim)
+    tensor_XVCache = rand_w(seq_len, dim, seq_len)
     
-    tensor_o_weight = np.random.rand(dim, dim).astype(np.float16)
-    tensor_up_weight = np.random.rand(dim, ffn_dim).astype(np.float16)
-    tensor_gate_weight = np.random.rand(dim, ffn_dim).astype(np.float16)
-    tensor_down_weight = np.random.rand(ffn_dim, dim).astype(np.float16)
+    tensor_o_weight = rand_w(dim, dim, dim)
+    tensor_up_weight = rand_w(dim, ffn_dim, dim)
+    tensor_gate_weight = rand_w(dim, ffn_dim, dim)
+    tensor_down_weight = rand_w(ffn_dim, dim, ffn_dim)
 
     # Run from inside out_<cfg> so simfab run artifacts (sim.log, sim_stats.json,
     # simconfig.json, simfab_traces/, out.core, wio_flows_tmpdir.*) land there

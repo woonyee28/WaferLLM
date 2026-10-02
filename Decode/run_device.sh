@@ -1,5 +1,5 @@
 set -e
-# Usage: ./run_device.sh <config.json>   (drives a real WSE-3 run via the cloud compiler)
+# Usage: ./run_device.sh <config.json> [launcher args, e.g. --replicate-bsz1]   (drives a real WSE-3 run via the cloud compiler)
 CONFIG=$1
 if [ -z "$CONFIG" ]; then
     echo "usage: ./run_device.sh <config.json>"
@@ -7,4 +7,5 @@ if [ -z "$CONFIG" ]; then
 fi
 
 python compile.py --mode device --config "$CONFIG"
-python launch_device.py --config "$CONFIG"
+shift
+python launch_device.py --config "$CONFIG" "$@"
